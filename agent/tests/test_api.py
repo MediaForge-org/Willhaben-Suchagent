@@ -1,5 +1,13 @@
 import httpx
 import pytest
+from fastapi import FastAPI
+
+from agent.app.core.config import Settings
+from agent.app.core.models import SearchCategory
+from agent.app.main import create_app
+from agent.app.notifications.service import FakeNotificationService, NtfyNotificationService
+from agent.app.willhaben.fake_provider import FakeListingProvider
+from agent.app.willhaben.marketplace_provider import WillhabenMarketplaceProvider
 
 
 @pytest.mark.asyncio
@@ -80,9 +88,160 @@ async def test_detailed_status_endpoint(api_client: httpx.AsyncClient) -> None:
     assert body["scheduler_running"] is False
     assert body["cycle_interval_seconds"] == 60
     assert body["max_concurrent_requests"] == 2
+    assert body["pending_notifications"] == 0
+    assert body["failed_notifications"] == 0
+    assert body["last_successful_notification_at"] is None
+    assert body["ntfy_enabled"] is True
     assert body["database_counts"] == {
         "searches": 0,
         "listings": 0,
         "search_matches": 0,
         "notifications": 0,
     }
+
+
+@pytest.mark.asyncio
+async def test_notification_test_endpoint_sends_without_creating_listing(
+    api_client: httpx.AsyncClient,
+    notifications: FakeNotificationService,
+) -> None:
+    response = await api_client.post("/api/v1/notifications/test")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "status": "sent",
+        "message": "Willhaben-Suchagent – Test erfolgreich",
+    }
+    assert notifications.test_notification_count == 1
+    status_response = await api_client.get("/api/v1/status")
+    assert status_response.json()["database_counts"]["listings"] == 0
+    assert status_response.json()["database_counts"]["notifications"] == 0
+
+
+@pytest.mark.asyncio
+async def test_recent_listings_endpoint_supports_limit_and_search_filter(
+    api_client: httpx.AsyncClient,
+    test_app: FastAPI,
+    provider: FakeListingProvider,
+    listing_factory,
+) -> None:
+    first_search_response = await api_client.post(
+        "/api/v1/searches",
+        json={
+            "name": "ThinkPad",
+            "category": "marketplace",
+            "query": "ThinkPad",
+            "category_filters": {"marketplace_category": "computer-software-5824"},
+        },
+    )
+    second_search_response = await api_client.post(
+        "/api/v1/searches",
+        json={
+            "name": "Notebook",
+            "category": "marketplace",
+            "query": "Notebook",
+        },
+    )
+    first_id = first_search_response.json()["id"]
+    second_id = second_search_response.json()["id"]
+    await test_app.state.scheduler.run_cycle()
+
+    shared = listing_factory(
+        "recent-shared",
+        category=SearchCategory.MARKETPLACE,
+        title="ThinkPad X1",
+        url="https://www.willhaben.at/iad/object/recent-shared",
+    )
+    only_second = listing_factory(
+        "recent-second",
+        category=SearchCategory.MARKETPLACE,
+        title="Notebook",
+        url="https://www.willhaben.at/iad/object/recent-second",
+    )
+    provider.set_results(first_id, [shared])
+    provider.set_results(second_id, [shared, only_second])
+    await test_app.state.scheduler.run_cycle()
+
+    response = await api_client.get("/api/v1/listings/recent", params={"limit": 1})
+    assert response.status_code == 200
+    assert len(response.json()) == 1
+    assert response.json()[0]["provider_listing_id"] == "recent-second"
+
+    filtered = await api_client.get(
+        "/api/v1/listings/recent",
+        params={"search_id": first_id},
+    )
+    assert filtered.status_code == 200
+    assert [item["provider_listing_id"] for item in filtered.json()] == ["recent-shared"]
+    assert filtered.json()[0]["search_ids"] == [first_id, second_id]
+    assert filtered.json()[0]["search_names"] == ["ThinkPad", "Notebook"]
+    assert filtered.json()[0]["listing_id"] > 0
+    assert filtered.json()[0]["first_seen_at"] is not None
+
+
+@pytest.mark.asyncio
+async def test_status_reports_cycle_notification_and_ntfy_state(
+    api_client: httpx.AsyncClient,
+    test_app: FastAPI,
+    provider: FakeListingProvider,
+    listing_factory,
+) -> None:
+    created = await api_client.post(
+        "/api/v1/searches",
+        json={"name": "Monitor", "category": "marketplace", "query": "Monitor"},
+    )
+    search_id = created.json()["id"]
+    await test_app.state.scheduler.run_cycle()
+    provider.set_results(
+        search_id,
+        [listing_factory("status-new", category=SearchCategory.MARKETPLACE)],
+    )
+    await test_app.state.scheduler.run_cycle()
+
+    body = (await api_client.get("/api/v1/status")).json()
+    assert body["last_cycle_started_at"] is not None
+    assert body["last_cycle_completed_at"] is not None
+    assert body["last_successful_willhaben_cycle_at"] is not None
+    assert body["active_searches"] == 1
+    assert body["pending_notifications"] == 0
+    assert body["last_successful_notification_at"] is not None
+    assert body["ntfy_enabled"] is True
+
+
+@pytest.mark.asyncio
+async def test_default_application_uses_real_provider_and_disabled_ntfy(
+    settings: Settings,
+) -> None:
+    app = create_app(settings)
+    assert isinstance(app.state.provider, WillhabenMarketplaceProvider)
+    assert app.state.scheduler.provider is app.state.provider
+    assert isinstance(app.state.notification_service, NtfyNotificationService)
+    assert app.state.notification_service.enabled is False
+
+    async with app.router.lifespan_context(app):
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.post("/api/v1/notifications/test")
+            status_response = await client.get("/api/v1/status")
+
+    assert response.status_code == 503
+    assert status_response.json()["ntfy_enabled"] is False
+    assert status_response.json()["ntfy_disabled_reason"] == "NTFY_ENABLED is false"
+
+
+@pytest.mark.asyncio
+async def test_lifespan_starts_and_stops_single_scheduler(settings: Settings) -> None:
+    enabled_settings = settings.model_copy(update={"scheduler_enabled": True})
+    app = create_app(
+        enabled_settings,
+        FakeListingProvider(),
+        FakeNotificationService(),
+    )
+
+    assert app.state.health.scheduler_running is False
+    async with app.router.lifespan_context(app):
+        assert app.state.health.scheduler_running is True
+        assert app.state.scheduler._task is not None
+        assert app.state.scheduler._task.get_name() == "global-search-scheduler"
+    assert app.state.health.scheduler_running is False
+    assert app.state.scheduler._task is None

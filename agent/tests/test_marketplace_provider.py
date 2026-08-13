@@ -49,7 +49,7 @@ async def test_provider_fetches_public_html_and_sends_configured_headers() -> No
     def response(request: httpx.Request) -> httpx.Response:
         assert request.url.params["keyword"] == "thinkpad"
         assert request.url.params["sort"] == "1"
-        assert request.headers["user-agent"].startswith("Willhaben-Suchagent/0.2")
+        assert request.headers["user-agent"].startswith("Willhaben-Suchagent/0.3")
         return httpx.Response(200, text=html, headers={"content-type": "text/html"})
 
     listings = await _search_with_handler(httpx.MockTransport(response))

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -12,9 +13,11 @@ from agent.app.core.health import HealthState
 from agent.app.core.logging import configure_logging
 from agent.app.core.provider import ListingProvider
 from agent.app.core.scheduler import Scheduler
-from agent.app.notifications.service import FakeNotificationService, NotificationService
+from agent.app.notifications.service import NotificationService, NtfyNotificationService
 from agent.app.storage.database import Database
 from agent.app.willhaben.marketplace_provider import WillhabenMarketplaceProvider
+
+logger = logging.getLogger(__name__)
 
 
 def create_app(
@@ -30,7 +33,17 @@ def create_app(
         max_redirects=resolved_settings.marketplace_max_redirects,
         max_response_bytes=resolved_settings.marketplace_max_response_bytes,
     )
-    resolved_notifications = notification_service or FakeNotificationService()
+    resolved_notifications = notification_service or NtfyNotificationService(
+        enabled=resolved_settings.ntfy_enabled,
+        base_url=resolved_settings.ntfy_base_url,
+        topic=resolved_settings.ntfy_topic,
+        token=(
+            resolved_settings.ntfy_token.get_secret_value()
+            if resolved_settings.ntfy_token is not None
+            else None
+        ),
+        timeout_seconds=resolved_settings.ntfy_timeout_seconds,
+    )
     database = Database(resolved_settings.database_path)
     health = HealthState()
     scheduler = Scheduler(
@@ -46,14 +59,22 @@ def create_app(
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         configure_logging(resolved_settings.log_level)
         await database.initialize()
+        if not resolved_notifications.enabled:
+            logger.info(
+                "notification_service_disabled reason=%s",
+                resolved_notifications.disabled_reason,
+            )
         if resolved_settings.scheduler_enabled:
             scheduler.start()
-        yield
-        await scheduler.stop()
+        try:
+            yield
+        finally:
+            await scheduler.stop()
+            await resolved_notifications.close()
 
     app = FastAPI(
         title="Willhaben-Suchagent",
-        version="0.2.0",
+        version="0.3.0",
         description="Local API for the Willhaben live search agent",
         lifespan=lifespan,
     )

@@ -42,9 +42,13 @@ CREATE TABLE IF NOT EXISTS search_matches (
 CREATE TABLE IF NOT EXISTS notifications (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     listing_id INTEGER NOT NULL UNIQUE REFERENCES listings(id) ON DELETE CASCADE,
-    status TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('pending', 'sent', 'failed')),
     created_at TEXT NOT NULL,
-    sent_at TEXT
+    updated_at TEXT NOT NULL,
+    last_attempt_at TEXT,
+    sent_at TEXT,
+    attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+    last_error TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_notifications_status ON notifications(status);

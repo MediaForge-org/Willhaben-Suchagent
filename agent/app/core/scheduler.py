@@ -89,6 +89,7 @@ class Scheduler:
 
     async def _fetch_one(self, search: SearchDefinition) -> SearchOutcome:
         async with self._semaphore:
+            logger.info("search_started search_id=%s", search.id)
             try:
                 listings = await self.provider.search(search)
                 logger.info(
@@ -120,6 +121,58 @@ class Scheduler:
                 )
                 return SearchOutcome(search=search, error=error)
 
+    async def _deliver_pending_notifications(self) -> tuple[int, int]:
+        pending = await self.database.list_deliverable_notifications()
+        if not pending:
+            return 0, 0
+        for notification in pending:
+            logger.info(
+                "notification_pending notification_id=%s provider_listing_id=%s attempt=%s",
+                notification.id,
+                notification.listing.provider_listing_id,
+                notification.attempt_count + 1,
+            )
+        if not self.notification_service.enabled:
+            logger.info(
+                "notification_delivery_disabled pending=%s reason=%s",
+                len(pending),
+                self.notification_service.disabled_reason,
+            )
+            return 0, 0
+
+        sent_count = 0
+        failed_count = 0
+        for notification in pending:
+            try:
+                await self.notification_service.notify_new_listing(notification.listing)
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                failed_count += 1
+                self.health.last_notification_error = type(error).__name__
+                await self.database.mark_notification_failed(
+                    notification.id,
+                    f"{type(error).__name__}: {error}",
+                )
+                logger.error(
+                    "notification_failed notification_id=%s provider_listing_id=%s error_type=%s",
+                    notification.id,
+                    notification.listing.provider_listing_id,
+                    type(error).__name__,
+                )
+                continue
+            await self.database.mark_notification_sent(notification.id)
+            sent_count += 1
+            self.health.last_successful_notification_at = utc_now()
+            logger.info(
+                "notification_sent notification_id=%s provider_listing_id=%s",
+                notification.id,
+                notification.listing.provider_listing_id,
+            )
+        if failed_count == 0:
+            self.health.last_notification_error = None
+        return sent_count, failed_count
+
     async def run_cycle(self) -> None:
         started_monotonic = monotonic()
         self.health.last_cycle_started_at = utc_now()
@@ -144,25 +197,20 @@ class Scheduler:
                     successful_results.append((outcome.search, outcome.listings or []))
 
             persistence = await self.database.persist_cycle_results(successful_results)
-            for listing in persistence.notification_listings:
-                try:
-                    await self.notification_service.notify_new_listing(listing)
-                except Exception as error:
-                    logger.error(
-                        "notification_failed provider_listing_id=%s error_type=%s",
-                        listing.provider_listing_id,
-                        type(error).__name__,
-                    )
-                    continue
-                await self.database.mark_notification_sent(listing.provider_listing_id)
+            sent_count, notification_failures = await self._deliver_pending_notifications()
 
-            if not self.health.last_provider_errors:
-                self.health.last_successful_cycle_at = utc_now()
+            if searches and not self.health.last_provider_errors:
+                successful_at = utc_now()
+                self.health.last_successful_cycle_at = successful_at
+                self.health.last_successful_willhaben_cycle_at = successful_at
             logger.info(
-                "cycle_results listings=%s new_listings=%s notifications=%s baselines=%s",
+                "cycle_results listings=%s new_listings=%s notifications_pending=%s "
+                "notifications_sent=%s notification_failures=%s baselines=%s",
                 sum(len(listings) for _, listings in successful_results),
                 persistence.new_listing_count,
-                len(persistence.notification_listings),
+                persistence.created_notification_count,
+                sent_count,
+                notification_failures,
                 persistence.baseline_initializations,
             )
         except asyncio.CancelledError:
@@ -174,6 +222,7 @@ class Scheduler:
             raise
         finally:
             duration = monotonic() - started_monotonic
+            self.health.last_cycle_completed_at = utc_now()
             self.health.last_cycle_duration_seconds = duration
             logger.info(
                 "cycle_completed cycle=%s duration_seconds=%.3f",

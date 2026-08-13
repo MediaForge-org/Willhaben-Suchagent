@@ -31,9 +31,30 @@ class SearchCreateData:
 
 @dataclass(slots=True)
 class CyclePersistenceResult:
-    notification_listings: list[Listing]
+    created_notification_count: int
     new_listing_count: int
     baseline_initializations: int
+
+
+@dataclass(slots=True)
+class PendingNotification:
+    id: int
+    listing: Listing
+    status: str
+    attempt_count: int
+
+
+@dataclass(slots=True)
+class RecentListing:
+    id: int
+    provider_listing_id: str
+    title: str
+    price: Decimal | None
+    location: str | None
+    url: str
+    first_seen_at: datetime
+    search_ids: list[int]
+    search_names: list[str]
 
 
 class Database:
@@ -49,7 +70,29 @@ class Database:
             await connection.execute("PRAGMA journal_mode = WAL")
             await connection.execute("PRAGMA synchronous = NORMAL")
             await connection.executescript(SCHEMA)
+            await self._migrate_notifications(connection)
             await connection.commit()
+
+    @staticmethod
+    async def _migrate_notifications(connection: aiosqlite.Connection) -> None:
+        """Add M3 delivery fields to databases created by M1/M2."""
+
+        cursor = await connection.execute("PRAGMA table_info(notifications)")
+        columns = {row[1] for row in await cursor.fetchall()}
+        additions = {
+            "updated_at": "TEXT",
+            "last_attempt_at": "TEXT",
+            "attempt_count": "INTEGER NOT NULL DEFAULT 0",
+            "last_error": "TEXT",
+        }
+        for name, definition in additions.items():
+            if name not in columns:
+                await connection.execute(
+                    f"ALTER TABLE notifications ADD COLUMN {name} {definition}"  # noqa: S608
+                )
+        await connection.execute(
+            "UPDATE notifications SET updated_at = created_at WHERE updated_at IS NULL"
+        )
 
     @asynccontextmanager
     async def _connect(self) -> AsyncIterator[aiosqlite.Connection]:
@@ -162,9 +205,7 @@ class Database:
             "price_max",
             "category_filters",
         }
-        reset_baseline = bool(reset_fields.intersection(changes)) or (
-            not current.enabled and validated.enabled
-        )
+        reset_baseline = bool(reset_fields.intersection(changes))
         timestamp = to_db_timestamp()
         async with self._write_lock, self._connect() as connection:
             await connection.execute(
@@ -215,10 +256,10 @@ class Database:
 
         results = list(successful_results)
         timestamp = to_db_timestamp()
-        notification_listings: list[Listing] = []
         new_provider_ids: set[str] = set()
         notification_candidates: dict[str, Listing] = {}
         baseline_initializations = 0
+        created_notification_count = 0
 
         async with self._write_lock, self._connect() as connection:
             await connection.execute("BEGIN IMMEDIATE")
@@ -324,7 +365,7 @@ class Database:
                         (timestamp, timestamp, timestamp, search.id),
                     )
 
-                for provider_id, listing in notification_candidates.items():
+                for provider_id in notification_candidates:
                     cursor = await connection.execute(
                         "SELECT id FROM listings WHERE provider_listing_id = ?",
                         (provider_id,),
@@ -332,37 +373,186 @@ class Database:
                     listing_row = await cursor.fetchone()
                     insert_cursor = await connection.execute(
                         """
-                        INSERT OR IGNORE INTO notifications(listing_id, status, created_at)
-                        VALUES (?, 'pending', ?)
+                        INSERT OR IGNORE INTO notifications(
+                            listing_id, status, created_at, updated_at
+                        )
+                        VALUES (?, 'pending', ?, ?)
                         """,
-                        (listing_row["id"], timestamp),
+                        (listing_row["id"], timestamp, timestamp),
                     )
                     if insert_cursor.rowcount > 0:
-                        notification_listings.append(listing)
+                        created_notification_count += 1
                 await connection.commit()
             except BaseException:
                 await connection.rollback()
                 raise
 
         return CyclePersistenceResult(
-            notification_listings=notification_listings,
+            created_notification_count=created_notification_count,
             new_listing_count=len(new_provider_ids),
             baseline_initializations=baseline_initializations,
         )
 
-    async def mark_notification_sent(self, provider_listing_id: str) -> None:
+    async def list_deliverable_notifications(self) -> list[PendingNotification]:
+        async with self._connect() as connection:
+            cursor = await connection.execute(
+                """
+                SELECT
+                    notifications.id AS notification_id,
+                    notifications.status,
+                    notifications.attempt_count,
+                    listings.provider_listing_id,
+                    listings.title,
+                    listings.price,
+                    listings.url,
+                    listings.image_url,
+                    listings.category,
+                    listings.location,
+                    listings.attributes_json
+                FROM notifications
+                JOIN listings ON listings.id = notifications.listing_id
+                WHERE notifications.status IN ('pending', 'failed')
+                ORDER BY notifications.created_at, notifications.id
+                """
+            )
+            rows = await cursor.fetchall()
+        return [
+            PendingNotification(
+                id=row["notification_id"],
+                status=row["status"],
+                attempt_count=row["attempt_count"],
+                listing=Listing(
+                    provider_listing_id=row["provider_listing_id"],
+                    title=row["title"],
+                    price=Decimal(row["price"]) if row["price"] is not None else None,
+                    url=row["url"],
+                    image_url=row["image_url"],
+                    category=row["category"],
+                    location=row["location"],
+                    attributes=json.loads(row["attributes_json"]),
+                ),
+            )
+            for row in rows
+        ]
+
+    async def mark_notification_sent(self, notification_id: int) -> None:
+        timestamp = to_db_timestamp()
         async with self._write_lock, self._connect() as connection:
             await connection.execute(
                 """
                 UPDATE notifications
-                SET status = 'sent', sent_at = ?
-                WHERE listing_id = (
-                    SELECT id FROM listings WHERE provider_listing_id = ?
-                )
+                SET status = 'sent', sent_at = ?, updated_at = ?, last_attempt_at = ?,
+                    attempt_count = attempt_count + 1, last_error = NULL
+                WHERE id = ? AND status IN ('pending', 'failed')
                 """,
-                (to_db_timestamp(), provider_listing_id),
+                (timestamp, timestamp, timestamp, notification_id),
             )
             await connection.commit()
+
+    async def mark_notification_failed(self, notification_id: int, error: str) -> None:
+        timestamp = to_db_timestamp()
+        async with self._write_lock, self._connect() as connection:
+            await connection.execute(
+                """
+                UPDATE notifications
+                SET status = 'failed', updated_at = ?, last_attempt_at = ?,
+                    attempt_count = attempt_count + 1, last_error = ?
+                WHERE id = ? AND status IN ('pending', 'failed')
+                """,
+                (timestamp, timestamp, error[:1000], notification_id),
+            )
+            await connection.commit()
+
+    async def notification_status(self, provider_listing_id: str) -> dict[str, Any] | None:
+        async with self._connect() as connection:
+            cursor = await connection.execute(
+                """
+                SELECT notifications.*
+                FROM notifications
+                JOIN listings ON listings.id = notifications.listing_id
+                WHERE listings.provider_listing_id = ?
+                """,
+                (provider_listing_id,),
+            )
+            row = await cursor.fetchone()
+        return dict(row) if row else None
+
+    async def count_notifications_with_status(self, status: str) -> int:
+        if status not in {"pending", "sent", "failed"}:
+            raise ValueError(f"Unsupported notification status: {status}")
+        async with self._connect() as connection:
+            cursor = await connection.execute(
+                "SELECT COUNT(*) FROM notifications WHERE status = ?",
+                (status,),
+            )
+            row = await cursor.fetchone()
+        return int(row[0])
+
+    async def last_successful_notification_at(self) -> datetime | None:
+        async with self._connect() as connection:
+            cursor = await connection.execute(
+                "SELECT MAX(sent_at) FROM notifications WHERE status = 'sent'"
+            )
+            row = await cursor.fetchone()
+        return datetime.fromisoformat(row[0]) if row and row[0] else None
+
+    async def list_recent_listings(
+        self,
+        *,
+        limit: int,
+        search_id: int | None = None,
+    ) -> list[RecentListing]:
+        parameters: list[Any] = []
+        condition = ""
+        if search_id is not None:
+            condition = (
+                "WHERE EXISTS ("
+                "SELECT 1 FROM search_matches selected_match "
+                "WHERE selected_match.listing_id = listings.id "
+                "AND selected_match.search_id = ?"
+                ")"
+            )
+            parameters.append(search_id)
+        parameters.append(limit)
+        async with self._connect() as connection:
+            cursor = await connection.execute(
+                f"""
+                SELECT listings.*
+                FROM listings
+                {condition}
+                ORDER BY listings.first_seen_at DESC, listings.id DESC
+                LIMIT ?
+                """,  # noqa: S608
+                tuple(parameters),
+            )
+            listing_rows = await cursor.fetchall()
+            recent: list[RecentListing] = []
+            for row in listing_rows:
+                matches_cursor = await connection.execute(
+                    """
+                    SELECT searches.id, searches.name
+                    FROM search_matches
+                    JOIN searches ON searches.id = search_matches.search_id
+                    WHERE search_matches.listing_id = ?
+                    ORDER BY searches.id
+                    """,
+                    (row["id"],),
+                )
+                matches = await matches_cursor.fetchall()
+                recent.append(
+                    RecentListing(
+                        id=row["id"],
+                        provider_listing_id=row["provider_listing_id"],
+                        title=row["title"],
+                        price=Decimal(row["price"]) if row["price"] is not None else None,
+                        location=row["location"],
+                        url=row["url"],
+                        first_seen_at=datetime.fromisoformat(row["first_seen_at"]),
+                        search_ids=[match["id"] for match in matches],
+                        search_names=[match["name"] for match in matches],
+                    )
+                )
+        return recent
 
     async def count(self, table: str) -> int:
         allowed_tables = {"searches", "listings", "search_matches", "notifications"}

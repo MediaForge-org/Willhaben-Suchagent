@@ -5,6 +5,7 @@ from pathlib import Path
 import httpx
 import pytest
 import pytest_asyncio
+from fastapi import FastAPI
 
 try:
     import uvloop
@@ -114,13 +115,18 @@ def listing_factory() -> Callable[..., Listing]:
 
 
 @pytest_asyncio.fixture
-async def api_client(
+async def test_app(
     settings: Settings,
     provider: FakeListingProvider,
     notifications: FakeNotificationService,
-) -> AsyncIterator[httpx.AsyncClient]:
+) -> AsyncIterator[FastAPI]:
     app = create_app(settings, provider, notifications)
     async with app.router.lifespan_context(app):
-        transport = httpx.ASGITransport(app=app)
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-            yield client
+        yield app
+
+
+@pytest_asyncio.fixture
+async def api_client(test_app: FastAPI) -> AsyncIterator[httpx.AsyncClient]:
+    transport = httpx.ASGITransport(app=test_app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        yield client

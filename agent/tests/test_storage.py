@@ -1,10 +1,45 @@
 import sqlite3
 from collections.abc import Callable
+from pathlib import Path
 
 import pytest
 
 from agent.app.core.models import Listing
 from agent.app.storage.database import Database, SearchCreateData
+
+
+@pytest.mark.asyncio
+async def test_initialize_migrates_m2_notification_table(tmp_path: Path) -> None:
+    path = tmp_path / "m2.db"
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE notifications (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                listing_id INTEGER NOT NULL UNIQUE,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                sent_at TEXT
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO notifications(listing_id, status, created_at)
+            VALUES (1, 'pending', '2026-01-01T00:00:00+00:00')
+            """
+        )
+
+    database = Database(path)
+    await database.initialize()
+
+    with sqlite3.connect(path) as connection:
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(notifications)")}
+        migrated = connection.execute(
+            "SELECT updated_at, attempt_count, last_error FROM notifications"
+        ).fetchone()
+    assert {"updated_at", "last_attempt_at", "attempt_count", "last_error"} <= columns
+    assert migrated == ("2026-01-01T00:00:00+00:00", 0, None)
 
 
 @pytest.mark.asyncio
@@ -56,7 +91,7 @@ async def test_database_constraints_prevent_duplicate_search_matches(
 
 
 @pytest.mark.asyncio
-async def test_reactivation_and_filter_change_reset_baseline(
+async def test_reactivation_preserves_baseline_but_filter_change_resets_it(
     database: Database,
     search_data: SearchCreateData,
 ) -> None:
@@ -71,9 +106,8 @@ async def test_reactivation_and_filter_change_reset_baseline(
     assert disabled.baseline_initialized is True
     reactivated = await database.update_search(search.id, {"enabled": True})
     assert reactivated is not None
-    assert reactivated.baseline_initialized is False
+    assert reactivated.baseline_initialized is True
 
-    await database.persist_cycle_results([(reactivated, [])])
     changed = await database.update_search(search.id, {"query": "BMW Touring"})
     assert changed is not None
     assert changed.baseline_initialized is False

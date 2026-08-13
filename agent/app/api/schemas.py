@@ -56,7 +56,9 @@ class HealthResponse(BaseModel):
     status: str
     process_started_at: datetime
     last_cycle_started_at: datetime | None
+    last_cycle_completed_at: datetime | None
     last_successful_cycle_at: datetime | None
+    last_successful_willhaben_cycle_at: datetime | None
     active_searches: int
     total_cycle_count: int
     failed_cycle_count: int
@@ -69,5 +71,28 @@ class StatusResponse(HealthResponse):
     max_concurrent_requests: int
     last_cycle_duration_seconds: float | None
     last_cycle_error: str | None
+    last_notification_error: str | None
     last_provider_errors: dict[int, str]
+    pending_notifications: int
+    failed_notifications: int
+    last_successful_notification_at: datetime | None
+    ntfy_enabled: bool
+    ntfy_disabled_reason: str | None
     database_counts: dict[str, int]
+
+
+class RecentListingResponse(BaseModel):
+    listing_id: int
+    provider_listing_id: str
+    title: str
+    price: Decimal | None
+    location: str | None
+    url: str
+    first_seen_at: datetime
+    search_ids: list[int]
+    search_names: list[str]
+
+
+class NotificationTestResponse(BaseModel):
+    status: str
+    message: str

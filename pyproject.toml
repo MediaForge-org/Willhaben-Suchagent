@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "willhaben-suchagent"
-version = "0.2.0"
+version = "0.3.0"
 description = "Local live search agent foundation for public willhaben.at listings"
 readme = "README.md"
 requires-python = ">=3.12"

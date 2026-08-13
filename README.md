@@ -1,60 +1,29 @@
 # Willhaben-Suchagent
 
 Willhaben-Suchagent ist ein lokal betriebener Live-Suchagent für öffentlich sichtbare
-Inserate auf willhaben.at. Mehrere Suchen teilen sich einen globalen Scheduler, der alle
-aktivierten Suchen standardmäßig alle 60 Sekunden prüft und neue Treffer systemweit
-dedupliziert.
+Marktplatz-Inserate auf willhaben.at. Mehrere aktivierte Suchen teilen sich genau einen
+globalen Scheduler. Er startet standardmäßig alle 60 Sekunden einen Cycle, begrenzt die
+Provider-Abfragen zentral und sendet global deduplizierte neue Treffer per ntfy aufs Handy.
 
-Der aktuelle Stand ist **Meilenstein M2 (echter Marktplatz-Provider)**. Der Provider ruft
-ausschließlich öffentliche Willhaben-Marktplatz-Suchergebnisse ohne Anmeldung ab. Auto &
-Motor, Immobilien und Jobs sind nicht Teil von M2.
+Der aktuelle Stand ist **Meilenstein M3 (End-to-End Live-Monitoring + ntfy)**. Es werden
+weder Willhaben-Login noch Accounts, Benutzer-Cookies, CAPTCHA-Umgehung, Proxy-/IP-Rotation
+oder aggressive Retries verwendet. Auto & Motor, Immobilien, Jobs, automatische Nachrichten
+und die Firefox-Extension gehören ausdrücklich nicht zu M3.
 
-## Was M2 enthält
+## Funktionsumfang
 
-- echter `WillhabenMarketplaceProvider` hinter der providerunabhängigen
-  `ListingProvider`-Schnittstelle
-- zentraler, deterministischer Search Builder für öffentliche Marktplatz-Seiten
-- gekapselter HTTPX-Transport mit Timeouts, höchstens drei Redirects, konfigurierbarem
-  User-Agent und einer Begrenzung der dekomprimierten Antwortgröße
-- kein automatisches Retry-Verhalten
-- Parser für die strukturierten `__NEXT_DATA__`-State-Daten der öffentlichen Webseite
-- Mapping in das bestehende providerunabhängige `Listing`-Modell
-- kontrollierte Klassifikation von HTTP-, Netzwerk-, Timeout-, Parser- und Challenge-Fehlern
-- reale, auf die benötigte Struktur reduzierte und bereinigte Offline-Fixtures
-- manueller CLI-Test für genau eine öffentliche Marktplatz-Suche
-- unveränderte Baseline-, Deduplizierungs- und 60-Sekunden-Scheduler-Architektur aus M1
-
-Der Provider extrahiert stabile Willhaben-Inserat-IDs, Titel, normalisierte Preise,
-öffentliche Detail-URLs, das erste Inseratbild, Standort, die Hauptkategorie `marketplace`
-und ausgewählte öffentliche Attribute wie Veröffentlichungszeit, Bundesland, Bezirk,
-Postleitzahl, PayLivery-/Privatstatus sowie Marktplatz-Kategorie-IDs. Fehlt ein optionales
-Feld, bleibt das restliche Inserat gültig. Einzelne defekte Inserate verwerfen nicht
-automatisch die übrigen Treffer.
-
-## Unterstützte Marktplatz-Filter
-
-| `SearchDefinition`-Feld | Öffentlicher Willhaben-Parameter |
-|---|---|
-| `query` | `keyword` |
-| `price_min` | `PRICE_FROM` |
-| `price_max` | `PRICE_TO` |
-| `location` | `areaId` |
-| `category_filters.marketplace_category` | öffentlicher SEO-Kategoriepfad |
-
-`location` unterstützt die acht österreichischen Flächenbundesländer und Wien sowie deren
-bestätigte numerische `areaId`. Freie Umkreis-, Bezirks- oder Ortsnamensuchen werden
-in M2 nicht geraten oder stillschweigend erweitert.
-
-Als `marketplace_category` werden aktuell die im realen Fixture bestätigten Kategorien
-akzeptiert: Bücher / Filme / Musik, Computer / Software, Dienstleistungen, Freizeit /
-Instrumente / Kulinarik, KFZ-Zubehör / Motorradteile, Mode / Accessoires, Smartphones /
-Telefonie und Wohnen / Haushalt / Gastronomie. Akzeptiert werden der Name, die numerische
-Kategorie-ID oder ein vollständiges SEO-Segment wie `computer-software-5824`. Unbekannte
-Filter lösen kontrolliert `ProviderInternalError` aus, statt eine breitere Suche auszuführen.
-
-Jede Anfrage setzt explizit `sort=1`. Die reale öffentliche Antwort bezeichnet diese
-Sortierung als `published.descending` beziehungsweise „Aktualität“. Damit werden die
-aktuellsten Inserate zuerst angefordert; Relevanzranking (`sort=7`) wird nicht verwendet.
+- FastAPI-Anwendung mit SQLite-Persistenz und automatischem Lifespan-Start
+- ein globaler Scheduler für alle aktiven Suchen, standardmäßig alle 60 Sekunden
+- Takt vom Start des vorherigen Cycles, nicht von dessen Ende
+- kontrollierte Provider-Parallelität, standardmäßig höchstens zwei Requests
+- echter `WillhabenMarketplaceProvider` für öffentliche Marktplatz-Suchergebnisse
+- Baseline beim ersten erfolgreichen Lauf ohne Benachrichtigungen
+- globale Listing-Deduplizierung und Search-Matches für alle passenden Suchen
+- persistente Notifications mit den Zuständen `pending`, `sent` und `failed`
+- ein Zustellversuch pro ausstehender Notification und Cycle, auch nach Neustarts
+- echter `NtfyNotificationService` mit Titel, Preis, Standort und Click-Link zum Inserat
+- Test-Push, Recent-Listings-API sowie erweiterter Health-/Status-Endpunkt
+- vollständig offline laufende Tests mit Fake-Providern und HTTP-Mocks
 
 ## Voraussetzungen und Installation
 
@@ -65,6 +34,7 @@ python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install -e '.[dev]'
+cp .env.example .env
 ```
 
 ## Konfiguration
@@ -78,29 +48,55 @@ python -m pip install -e '.[dev]'
 | API-Port | `8000` | `WILLHABEN_API_PORT` |
 | Umgebung | `development` | `WILLHABEN_APP_ENVIRONMENT` |
 | Scheduler aktiv | `true` | `WILLHABEN_SCHEDULER_ENABLED` |
+| ntfy aktiv | `false` | `NTFY_ENABLED` |
+| ntfy-Basis-URL | `https://ntfy.sh` | `NTFY_BASE_URL` |
+| ntfy-Topic | nicht gesetzt | `NTFY_TOPIC` |
+| optionaler ntfy-Token | nicht gesetzt | `NTFY_TOKEN` |
+| ntfy-Timeout | 10 Sekunden | `NTFY_TIMEOUT` |
 | Provider-User-Agent | siehe `.env.example` | `WILLHABEN_MARKETPLACE_USER_AGENT` |
 | Connect-Timeout | 10 Sekunden | `WILLHABEN_MARKETPLACE_CONNECT_TIMEOUT_SECONDS` |
 | Read-Timeout | 20 Sekunden | `WILLHABEN_MARKETPLACE_READ_TIMEOUT_SECONDS` |
 | maximale Redirects | 3 | `WILLHABEN_MARKETPLACE_MAX_REDIRECTS` |
 | maximale Antwortgröße | 5.000.000 Bytes | `WILLHABEN_MARKETPLACE_MAX_RESPONSE_BYTES` |
 
-`.env.example` dient als Vorlage. Laufzeitdaten, Datenbanken, Secrets, Logs und virtuelle
-Umgebungen sind durch `.gitignore` ausgeschlossen.
+Ohne `NTFY_ENABLED=true` und ein nicht leeres `NTFY_TOPIC` startet die Anwendung normal,
+weist ntfy aber nachvollziehbar als deaktiviert aus. Tokens werden nur aus Konfiguration
+beziehungsweise Environment gelesen und weder im Status noch in Logs ausgegeben. Für das
+öffentliche `ntfy.sh` empfiehlt sich ein langer, schwer zu erratender Topic-Name. Ein Token
+ist nur nötig, wenn der gewählte Server beziehungsweise das Topic Authentifizierung verlangt.
 
-## Anwendung und SearchDefinition
+## Datenfluss und Zustellmodell
 
-```bash
-source .venv/bin/activate
-willhaben-suchagent
+```text
+SearchDefinition
+  -> globaler Scheduler
+  -> WillhabenMarketplaceProvider
+  -> Listing[]
+  -> Baseline + globale Deduplizierung + Search-Matches
+  -> persistente Notification (pending)
+  -> NtfyNotificationService
+  -> sent oder failed
 ```
 
-Alternativ:
+Beim ersten erfolgreichen Lauf einer Suche werden die aktuellen Listings und Matches als
+Baseline gespeichert, ohne Push. Ab dem folgenden erfolgreichen Lauf erzeugt nur ein global
+unbekanntes Listing eine Notification. Passt dasselbe Listing gleichzeitig zu mehreren
+Suchen, werden alle Matches gespeichert, aber nur eine Notification angelegt.
 
-```bash
-python -m uvicorn agent.app.main:app --host 127.0.0.1 --port 8000
-```
+Eine neue Notification beginnt als `pending`. Nach erfolgreicher ntfy-Antwort wird sie
+`sent`; bei Timeout, Netzwerk- oder HTTP-Fehler wird sie `failed`, der Fehler und die
+Versuchsanzahl werden gespeichert. `pending` und `failed` werden in einem späteren globalen
+Cycle erneut versucht, ohne schnelle Retry-Schleife. Ein Neustart verliert sie nicht.
+Bereits als `sent` gespeicherte Notifications werden nicht erneut ausgewählt.
 
-Eine Marktplatz-Suche lässt sich über die lokale API anlegen:
+Deaktivieren und späteres Reaktivieren behält eine bereits initialisierte Baseline und alle
+bekannten Listings bei. Dadurch werden nach der Reaktivierung nur wirklich global unbekannte
+Listings gemeldet. Eine Änderung der eigentlichen Filter setzt die Baseline der Suche zurück;
+eine reine Umbenennung oder Aktivierung/Deaktivierung tut das nicht.
+
+## Search API
+
+Eine echte Marketplace-Suche kann direkt aktiviert angelegt werden:
 
 ```bash
 curl -X POST http://127.0.0.1:8000/api/v1/searches \
@@ -112,19 +108,120 @@ curl -X POST http://127.0.0.1:8000/api/v1/searches \
     "location": "Wien",
     "price_min": 100,
     "price_max": 1200,
-    "category_filters": {"marketplace_category": "computer-software-5824"}
+    "category_filters": {"marketplace_category": "computer-software-5824"},
+    "enabled": true
   }'
 ```
 
-Beim ersten erfolgreichen Lauf wird die Baseline initialisiert: bereits vorhandene Treffer
-werden gespeichert, lösen aber keine Notification aus. Erst global unbekannte Treffer eines
-späteren erfolgreichen Cycles erzeugen ein Notification-Ereignis. Filteränderungen und eine
-erneute Aktivierung setzen die Baseline der betroffenen Suche zurück.
+Aktivieren und deaktivieren erfolgt ohne neuen Timer über den bestehenden PATCH-Endpunkt:
 
-## Einzelne Suche manuell testen
+```bash
+curl -X PATCH http://127.0.0.1:8000/api/v1/searches/1 \
+  -H 'Content-Type: application/json' \
+  -d '{"enabled": false}'
 
-Der Development-Befehl führt genau einen öffentlichen Request aus und zeigt Trefferzahl,
-die ersten IDs, Titel, Preise und Detail-URLs:
+curl -X PATCH http://127.0.0.1:8000/api/v1/searches/1 \
+  -H 'Content-Type: application/json' \
+  -d '{"enabled": true}'
+```
+
+Zuletzt gefundene Listings, optional gefiltert nach Search-ID und immer neueste zuerst:
+
+```bash
+curl 'http://127.0.0.1:8000/api/v1/listings/recent?limit=20'
+curl 'http://127.0.0.1:8000/api/v1/listings/recent?limit=20&search_id=1'
+```
+
+## Unterstützte Marktplatz-Filter
+
+| `SearchDefinition`-Feld | Öffentlicher Willhaben-Parameter |
+|---|---|
+| `query` | `keyword` |
+| `price_min` | `PRICE_FROM` |
+| `price_max` | `PRICE_TO` |
+| `location` | `areaId` |
+| `category_filters.marketplace_category` | öffentlicher SEO-Kategoriepfad |
+
+`location` unterstützt die österreichischen Bundesländer und Wien sowie deren bestätigte
+numerische `areaId`. Freie Umkreis-, Bezirks- oder Ortsnamensuchen werden nicht geraten.
+
+Als `marketplace_category` werden aktuell die anhand der öffentlichen Antwortstruktur
+bestätigten Kategorien akzeptiert: Bücher / Filme / Musik, Computer / Software,
+Dienstleistungen, Freizeit / Instrumente / Kulinarik, KFZ-Zubehör / Motorradteile, Mode /
+Accessoires, Smartphones / Telefonie und Wohnen / Haushalt / Gastronomie. Akzeptiert werden
+Name, numerische Kategorie-ID oder SEO-Segment wie `computer-software-5824`. Unbekannte
+Filter führen kontrolliert zu einem Providerfehler, statt still breiter zu suchen.
+
+Jede Anfrage setzt `sort=1`, in der öffentlichen Antwort als `published.descending` /
+„Aktualität“ bezeichnet. Es wird höchstens die erste öffentliche Ergebnisseite verarbeitet;
+M3 implementiert kein aggressives Paging oder Crawling.
+
+## Konkreter lokaler End-to-End-Test
+
+Diese Schritte sind für einen echten Test außerhalb einer eventuell netzwerkbeschränkten
+Entwicklungs-Sandbox gedacht.
+
+1. `.env` aus der Vorlage erstellen und mindestens diese Werte eintragen:
+
+   ```dotenv
+   NTFY_ENABLED=true
+   NTFY_BASE_URL=https://ntfy.sh
+   NTFY_TOPIC=ein-langer-eindeutiger-privater-topic-name
+   NTFY_TOKEN=
+   NTFY_TIMEOUT=10
+   WILLHABEN_CYCLE_INTERVAL_SECONDS=60
+   WILLHABEN_MAX_CONCURRENT_REQUESTS=2
+   ```
+
+2. In der ntfy-App auf dem Handy denselben Topic-Namen abonnieren.
+
+3. Anwendung starten:
+
+   ```bash
+   source .venv/bin/activate
+   willhaben-suchagent
+   ```
+
+4. In einem zweiten Terminal den klar getrennten Test-Push senden. Dieser erzeugt kein
+   Fake-Listing und keine Listing-Notification in SQLite:
+
+   ```bash
+   curl -X POST http://127.0.0.1:8000/api/v1/notifications/test
+   ```
+
+   Erwartete Nachricht: `Willhaben-Suchagent – Test erfolgreich`.
+
+5. Eine echte Marketplace-Suche mit dem oben gezeigten `POST /api/v1/searches` anlegen.
+   Die Antwort enthält die Search-ID und `baseline_initialized: false`.
+
+6. Den unmittelbar gestarteten beziehungsweise nächsten globalen Cycle im Log beobachten.
+   `baseline_initialized` wird nach dem ersten erfolgreichen Abruf `true`; vorhandene
+   Inserate lösen dabei absichtlich keinen Push aus:
+
+   ```bash
+   curl http://127.0.0.1:8000/api/v1/searches/1
+   ```
+
+7. Die Suche aktiviert lassen. Der Scheduler startet Folge-Cycles jeweils 60 Sekunden nach
+   dem vorherigen Cycle-Start. Ein danach erstmals sichtbares Inserat erzeugt einen ntfy-Push;
+   Antippen öffnet dessen echte Willhaben-URL.
+
+8. Live-Status und gefundene Listings prüfen:
+
+   ```bash
+   curl http://127.0.0.1:8000/health
+   curl http://127.0.0.1:8000/api/v1/status
+   curl 'http://127.0.0.1:8000/api/v1/listings/recent?limit=20&search_id=1'
+   ```
+
+9. Den Agenten im ersten Terminal mit `Ctrl-C` kontrolliert stoppen. FastAPI beendet den
+   Scheduler, bricht dessen offene Task ab und schließt den ntfy-HTTP-Client. SQLite verwendet
+   pro Operation kontrolliert geschlossene Verbindungen.
+
+## Einzelne öffentliche Suche diagnostisch testen
+
+Der bestehende Development-Befehl führt genau einen öffentlichen Request aus und zeigt die
+ersten Treffer. Er ist nicht für das dauerhafte Monitoring nötig:
 
 ```bash
 source .venv/bin/activate
@@ -136,67 +233,46 @@ willhaben-marketplace-search 'ThinkPad' \
   --limit 5
 ```
 
-Ohne erneute Installation kann derselbe Test so gestartet werden:
-
-```bash
-python -m agent.app.willhaben.cli 'ThinkPad' --location Wien --limit 5
-```
-
-Der manuelle Test ist absichtlich kein Crawl und enthält keine Retry- oder Parallel-Schleife.
-
 ## Fehler- und Schutzverhalten
 
+- HTTP 429 wird `RateLimitedError`, HTTP 403 wird `AccessDeniedError`.
+- Erkannte CAPTCHA-/Challenge-Seiten werden `ChallengeDetectedError`.
 - Netzwerkfehler werden `NetworkError`, Timeouts `RequestTimeoutError`.
-- HTTP 429 wird unmittelbar `RateLimitedError`.
-- HTTP 403 wird unmittelbar `AccessDeniedError`.
-- erkannte CAPTCHA-, Bot- oder Challenge-Seiten werden `ChallengeDetectedError`.
-- unerwartete oder nicht parsebare Seiten werden `ParseError`.
-- andere HTTP- und Providerfehler werden `ProviderInternalError`.
-
-Bei 403, 429 oder Challenges wird kontrolliert abgebrochen. Es gibt keine Header-Rotation,
-Proxy-/IP-Rotation, CAPTCHA-Umgehung oder andere Mechanismen zur Umgehung von Sperren. Der
-Provider verwendet keinen Willhaben-Account, kein Login, keine Benutzer-Cookies und keine
-authentifizierte Session. Geloggt werden Request-Beginn, Search-ID, HTTP-Status, Trefferzahl
-und Fehlerklasse, jedoch weder komplette Seiten noch Cookies oder Secrets.
+- Einzelne Search-Fehler werden gespeichert und verhindern andere Suchen desselben Cycles
+  möglichst nicht.
+- Es gibt keine unmittelbare Provider-Retry-Schleife, keinen Neustart-Loop, keine Header-,
+  Proxy- oder IP-Rotation und keinen Versuch, Schutzmechanismen zu umgehen.
+- ntfy-Ausfälle erzeugen keinen Prozesscrash; Zustellungen bleiben persistent wiederholbar.
+- Logs enthalten Cycle-/Search-/Listing-/Notification-Ergebnisse und Dauer, aber keine
+  Cookies, Tokens oder vollständigen Environment-Werte.
 
 ## Tests und Qualität
 
-Alle automatisierten Tests arbeiten mit Mock-Transporten, temporären SQLite-Datenbanken und
-bereinigten Fixtures. Sie greifen niemals live auf willhaben.at zu:
+Alle automatisierten Tests nutzen Mock-Transporte, temporäre SQLite-Datenbanken und lokale
+Fixtures. Sie greifen nicht auf willhaben.at oder ntfy.sh zu:
 
 ```bash
 source .venv/bin/activate
 pytest
 ruff check .
 ruff format --check .
+git diff --check
+pytest
 ```
 
-## Architektur
+## Architektur und bekannte Grenzen
 
-- `agent/app/api`: lokale HTTP-Schnittstelle und API-Schemas
-- `agent/app/core`: Konfiguration, Domain-Modelle, Provider-Vertrag, Scheduler und Health-State
-- `agent/app/storage`: SQLite-Schema und Repository-/Transaktionslogik
-- `agent/app/notifications`: providerunabhängiger Notification-Vertrag
-- `agent/app/willhaben/marketplace_search.py`: zentraler Marktplatz-Search-Builder
-- `agent/app/willhaben/http_client.py`: begrenzter öffentlicher HTTPX-Transport
-- `agent/app/willhaben/marketplace_parser.py`: State-Parser und Listing-Mapping
-- `agent/app/willhaben/marketplace_provider.py`: Provider-Orchestrierung und Fehlerklassifikation
-- `agent/tests/fixtures/willhaben`: bereinigte reale Antwortstruktur für Offline-Tests
+- `agent/app/api`: lokale CRUD-, Listings-, Notification- und Status-API
+- `agent/app/core`: Konfiguration, Domain-Modelle, Scheduler und Health-State
+- `agent/app/storage`: SQLite-Schema, Migration und transaktionale Deduplizierung
+- `agent/app/notifications`: providerunabhängiger Vertrag und ntfy-Transport
+- `agent/app/willhaben`: Search Builder, HTTP-Transport, Parser und echter Provider
 
-Der Scheduler kennt weiterhin keine Willhaben-spezifischen URLs, HTML- oder JSON-Strukturen.
-Sein Ablauf bleibt `SearchDefinition → ListingProvider → Listing → Baseline/Deduplizierung`.
+Der Scheduler kennt keine Willhaben-spezifischen HTML-/JSON-Strukturen. Öffentliche
+Seitenstrukturen können sich ändern; Abweichungen enden kontrolliert mit `ParseError`. ntfy
+und Willhaben müssen für den echten Alltagstest vom lokalen Rechner erreichbar sein.
 
-## Bekannte Einschränkungen und M3
-
-- Öffentliche Seitenstrukturen können sich ändern; strukturelle Abweichungen brechen
-  kontrolliert mit `ParseError` ab.
-- M2 unterstützt nur nachweisbar abgebildete Bundesländer und Marktplatz-Kategorien.
-- Die maximal erste öffentliche Ergebnisseite mit standardmäßig 30 Treffern wird verarbeitet;
-  es gibt kein aggressives Paging oder Crawling.
-- Bei Netzwerksperren, 403, 429 und Challenges wird nicht versucht, die Sperre zu umgehen.
-- Firefox-Extension, ntfy, Nachrichten-Templates, automatisches Anschreiben, Account/Login,
-  Auto & Motor, Immobilien und Jobs sind nicht implementiert.
-
-M3 wurde ausdrücklich nicht begonnen. Ein späterer Meilenstein muss die jeweils vorgesehenen
-weiteren Funktionen separat ergänzen, ohne Willhaben-spezifische Logik in den Scheduler zu
-verschieben.
+Die M3-API ist zunächst für Entwickler bedienbar. Eine spätere Firefox-Extension kann über
+dieselben Search-, Status- und Recent-Listings-Endpunkte Suchen verwalten, ohne die Scheduler-
+oder Persistenzarchitektur umzubauen. Ein normaler Endbenutzer soll langfristig keine
+Terminalbefehle benötigen. **M4 ist nicht Bestandteil dieses Stands.**

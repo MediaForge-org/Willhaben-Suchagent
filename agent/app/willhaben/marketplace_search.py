@@ -71,7 +71,7 @@ class MarketplaceSearchBuilder:
 
     def build(self, search: SearchDefinition) -> MarketplaceSearchRequest:
         if search.category is not SearchCategory.MARKETPLACE:
-            raise UnsupportedMarketplaceSearch("Only marketplace searches are supported in M2")
+            raise UnsupportedMarketplaceSearch("Only marketplace searches are supported")
 
         path = MARKETPLACE_BASE_URL
         category = search.category_filters.get("marketplace_category")

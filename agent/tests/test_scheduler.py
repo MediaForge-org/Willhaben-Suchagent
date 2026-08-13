@@ -13,9 +13,26 @@ from agent.app.core.exceptions import (
 from agent.app.core.health import HealthState
 from agent.app.core.models import Listing
 from agent.app.core.scheduler import Scheduler
-from agent.app.notifications.service import FakeNotificationService
+from agent.app.notifications.service import FakeNotificationService, NotificationService
 from agent.app.storage.database import Database, SearchCreateData
 from agent.app.willhaben.fake_provider import FakeListingProvider
+
+
+class FlakyNotificationService(NotificationService):
+    def __init__(self, *, failing: bool = True) -> None:
+        self.failing = failing
+        self.attempted: list[str] = []
+        self.sent: list[str] = []
+
+    async def notify_new_listing(self, listing: Listing) -> None:
+        self.attempted.append(listing.provider_listing_id)
+        if self.failing:
+            raise RuntimeError("simulated ntfy outage")
+        self.sent.append(listing.provider_listing_id)
+
+    async def notify_test(self) -> None:
+        if self.failing:
+            raise RuntimeError("simulated ntfy outage")
 
 
 @pytest.mark.asyncio
@@ -203,6 +220,7 @@ async def test_expected_provider_errors_do_not_destroy_scheduler(
     scheduler = scheduler_factory(health=health)
 
     await scheduler.run_cycle()
+    assert provider.calls == [search.id]
     provider.set_results(search.id, [])
     await scheduler.run_cycle()
 
@@ -213,3 +231,173 @@ async def test_expected_provider_errors_do_not_destroy_scheduler(
     assert refreshed is not None
     assert refreshed.consecutive_errors == 0
     assert refreshed.baseline_initialized is True
+
+
+@pytest.mark.asyncio
+async def test_notification_failure_is_persisted_and_retried_in_later_cycle(
+    database: Database,
+    search_data: SearchCreateData,
+    provider: FakeListingProvider,
+    scheduler_factory: Callable[..., Scheduler],
+    listing_factory: Callable[..., Listing],
+) -> None:
+    search = await database.create_search(search_data)
+    provider.set_results(search.id, [])
+    notifications = FlakyNotificationService()
+    health = HealthState()
+    scheduler = scheduler_factory(notification_service=notifications, health=health)
+    await scheduler.run_cycle()
+
+    new_listing = listing_factory("retry-me")
+    provider.set_results(search.id, [new_listing])
+    await scheduler.run_cycle()
+
+    failed = await database.notification_status("retry-me")
+    assert failed is not None
+    assert failed["status"] == "failed"
+    assert failed["attempt_count"] == 1
+    assert "RuntimeError" in failed["last_error"]
+    assert health.failed_cycle_count == 0
+    assert notifications.attempted == ["retry-me"]
+
+    notifications.failing = False
+    await scheduler.run_cycle()
+
+    sent = await database.notification_status("retry-me")
+    assert sent is not None
+    assert sent["status"] == "sent"
+    assert sent["attempt_count"] == 2
+    assert sent["last_error"] is None
+    assert notifications.sent == ["retry-me"]
+    assert health.last_successful_notification_at is not None
+
+
+@pytest.mark.asyncio
+async def test_disabled_notification_service_keeps_notification_pending(
+    database: Database,
+    search_data: SearchCreateData,
+    provider: FakeListingProvider,
+    scheduler_factory: Callable[..., Scheduler],
+    listing_factory: Callable[..., Listing],
+) -> None:
+    search = await database.create_search(search_data)
+    provider.set_results(search.id, [])
+    disabled = FlakyNotificationService(failing=False)
+    disabled.enabled = False
+    disabled.disabled_reason = "not configured"
+    scheduler = scheduler_factory(notification_service=disabled)
+    await scheduler.run_cycle()
+    provider.set_results(search.id, [listing_factory("waiting-for-config")])
+
+    await scheduler.run_cycle()
+
+    notification = await database.notification_status("waiting-for-config")
+    assert notification is not None
+    assert notification["status"] == "pending"
+    assert notification["attempt_count"] == 0
+    assert disabled.attempted == []
+
+
+@pytest.mark.asyncio
+async def test_restart_retries_failed_notification_without_duplicate_listing(
+    database: Database,
+    search_data: SearchCreateData,
+    provider: FakeListingProvider,
+    scheduler_factory: Callable[..., Scheduler],
+    listing_factory: Callable[..., Listing],
+) -> None:
+    search = await database.create_search(search_data)
+    provider.set_results(search.id, [])
+    failing = FlakyNotificationService()
+    scheduler = scheduler_factory(notification_service=failing)
+    await scheduler.run_cycle()
+    provider.set_results(search.id, [listing_factory("survives-restart")])
+    await scheduler.run_cycle()
+
+    restarted_database = Database(database.path)
+    await restarted_database.initialize()
+    restarted_provider = FakeListingProvider()
+    restarted_provider.set_results(search.id, [])
+    restarted_notifications = FakeNotificationService()
+    restarted_scheduler = Scheduler(
+        database=restarted_database,
+        provider=restarted_provider,
+        notification_service=restarted_notifications,
+        health=HealthState(),
+        cycle_interval_seconds=60,
+        max_concurrent_requests=2,
+    )
+    await restarted_scheduler.run_cycle()
+
+    assert [item.provider_listing_id for item in restarted_notifications.notifications] == [
+        "survives-restart"
+    ]
+    assert await restarted_database.count("listings") == 1
+    notification = await restarted_database.notification_status("survives-restart")
+    assert notification is not None
+    assert notification["status"] == "sent"
+
+
+@pytest.mark.asyncio
+async def test_sent_notification_is_not_repeated_after_restart(
+    database: Database,
+    search_data: SearchCreateData,
+    provider: FakeListingProvider,
+    scheduler_factory: Callable[..., Scheduler],
+    listing_factory: Callable[..., Listing],
+) -> None:
+    search = await database.create_search(search_data)
+    provider.set_results(search.id, [])
+    await scheduler_factory().run_cycle()
+    listing = listing_factory("already-sent")
+    provider.set_results(search.id, [listing])
+    await scheduler_factory().run_cycle()
+
+    restarted_database = Database(database.path)
+    await restarted_database.initialize()
+    restarted_provider = FakeListingProvider()
+    restarted_provider.set_results(search.id, [listing])
+    restarted_notifications = FakeNotificationService()
+    restarted_scheduler = Scheduler(
+        database=restarted_database,
+        provider=restarted_provider,
+        notification_service=restarted_notifications,
+        health=HealthState(),
+        cycle_interval_seconds=60,
+        max_concurrent_requests=2,
+    )
+    await restarted_scheduler.run_cycle()
+
+    assert restarted_notifications.notifications == []
+    notification = await restarted_database.notification_status("already-sent")
+    assert notification is not None
+    assert notification["status"] == "sent"
+    assert notification["attempt_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_reactivated_initialized_search_only_notifies_unknown_listing(
+    database: Database,
+    search_data: SearchCreateData,
+    provider: FakeListingProvider,
+    notifications: FakeNotificationService,
+    scheduler_factory: Callable[..., Scheduler],
+    listing_factory: Callable[..., Listing],
+) -> None:
+    search = await database.create_search(search_data)
+    known = listing_factory("known-before-disable")
+    provider.set_results(search.id, [known])
+    scheduler = scheduler_factory()
+    await scheduler.run_cycle()
+    await database.update_search(search.id, {"enabled": False})
+    reactivated = await database.update_search(search.id, {"enabled": True})
+    assert reactivated is not None
+    assert reactivated.baseline_initialized is True
+
+    unknown = listing_factory("new-after-reactivation")
+    provider.set_results(search.id, [known, unknown])
+    await scheduler.run_cycle()
+
+    assert [item.provider_listing_id for item in notifications.notifications] == [
+        "new-after-reactivation"
+    ]

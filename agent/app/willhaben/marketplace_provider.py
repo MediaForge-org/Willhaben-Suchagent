@@ -22,7 +22,7 @@ from agent.app.willhaben.marketplace_search import (
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_USER_AGENT = "Willhaben-Suchagent/0.2 (public Marketplace search; no authentication)"
+DEFAULT_USER_AGENT = "Willhaben-Suchagent/0.3 (public Marketplace search; no authentication)"
 
 
 class WillhabenMarketplaceProvider(ListingProvider):
