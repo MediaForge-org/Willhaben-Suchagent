@@ -1,0 +1,215 @@
+import asyncio
+from collections.abc import Callable
+from dataclasses import replace
+
+import pytest
+
+from agent.app.core.exceptions import (
+    AccessDeniedError,
+    ChallengeDetectedError,
+    RateLimitedError,
+    RequestTimeoutError,
+)
+from agent.app.core.health import HealthState
+from agent.app.core.models import Listing
+from agent.app.core.scheduler import Scheduler
+from agent.app.notifications.service import FakeNotificationService
+from agent.app.storage.database import Database, SearchCreateData
+from agent.app.willhaben.fake_provider import FakeListingProvider
+
+
+@pytest.mark.asyncio
+async def test_disabled_search_is_not_executed(
+    database: Database,
+    search_data: SearchCreateData,
+    provider: FakeListingProvider,
+    scheduler_factory: Callable[..., Scheduler],
+) -> None:
+    search_data.enabled = False
+    search = await database.create_search(search_data)
+
+    await scheduler_factory().run_cycle()
+
+    assert search.id not in provider.calls
+
+
+@pytest.mark.asyncio
+async def test_baseline_then_one_notification_then_deduplication(
+    database: Database,
+    search_data: SearchCreateData,
+    provider: FakeListingProvider,
+    notifications: FakeNotificationService,
+    scheduler_factory: Callable[..., Scheduler],
+    listing_factory: Callable[..., Listing],
+) -> None:
+    search = await database.create_search(search_data)
+    existing = listing_factory("existing")
+    provider.set_results(search.id, [existing])
+    scheduler = scheduler_factory()
+
+    await scheduler.run_cycle()
+    assert notifications.notifications == []
+    assert await database.count("listings") == 1
+    assert await database.count("notifications") == 0
+    initialized_search = await database.get_search(search.id)
+    assert initialized_search is not None
+    assert initialized_search.baseline_initialized is True
+
+    new_listing = listing_factory("new")
+    provider.set_results(search.id, [existing, new_listing])
+    await scheduler.run_cycle()
+    assert [item.provider_listing_id for item in notifications.notifications] == ["new"]
+    assert await database.count("notifications") == 1
+
+    await scheduler.run_cycle()
+    assert len(notifications.notifications) == 1
+    assert await database.count("notifications") == 1
+
+
+@pytest.mark.asyncio
+async def test_shared_listing_notifies_once_but_stores_both_matches(
+    database: Database,
+    search_data: SearchCreateData,
+    provider: FakeListingProvider,
+    notifications: FakeNotificationService,
+    scheduler_factory: Callable[..., Scheduler],
+    listing_factory: Callable[..., Listing],
+) -> None:
+    first = await database.create_search(search_data)
+    second_data = replace(search_data, name="BMW 340i", query="BMW 340i")
+    second = await database.create_search(second_data)
+    scheduler = scheduler_factory()
+
+    await scheduler.run_cycle()
+    shared = listing_factory("shared")
+    provider.set_results(first.id, [shared])
+    provider.set_results(second.id, [shared])
+    await scheduler.run_cycle()
+
+    assert len(notifications.notifications) == 1
+    assert await database.count("listings") == 1
+    assert await database.count("search_matches") == 2
+    assert await database.count("notifications") == 1
+
+
+@pytest.mark.asyncio
+async def test_known_listings_survive_database_restart(
+    database: Database,
+    search_data: SearchCreateData,
+    provider: FakeListingProvider,
+    notifications: FakeNotificationService,
+    scheduler_factory: Callable[..., Scheduler],
+    listing_factory: Callable[..., Listing],
+) -> None:
+    search = await database.create_search(search_data)
+    listing = listing_factory("persistent")
+    provider.set_results(search.id, [listing])
+    await scheduler_factory().run_cycle()
+
+    restarted_database = Database(database.path)
+    await restarted_database.initialize()
+    restarted_provider = FakeListingProvider()
+    restarted_notifications = FakeNotificationService()
+    restarted_provider.set_results(search.id, [listing])
+    restarted_scheduler = Scheduler(
+        database=restarted_database,
+        provider=restarted_provider,
+        notification_service=restarted_notifications,
+        health=HealthState(),
+        cycle_interval_seconds=60,
+        max_concurrent_requests=2,
+    )
+    await restarted_scheduler.run_cycle()
+
+    assert await restarted_database.count("listings") == 1
+    assert restarted_notifications.notifications == []
+
+
+@pytest.mark.asyncio
+async def test_all_searches_share_one_cycle_and_concurrency_is_limited(
+    database: Database,
+    search_data: SearchCreateData,
+    scheduler_factory: Callable[..., Scheduler],
+) -> None:
+    searches = []
+    for index in range(5):
+        data = replace(search_data, name=f"Search {index}")
+        searches.append(await database.create_search(data))
+    slow_provider = FakeListingProvider(delay_seconds=0.02)
+    health = HealthState()
+    scheduler = scheduler_factory(
+        provider=slow_provider,
+        health=health,
+        max_concurrent_requests=2,
+    )
+
+    await scheduler.run_cycle()
+
+    assert set(slow_provider.calls) == {search.id for search in searches}
+    assert health.total_cycle_count == 1
+    assert slow_provider.max_observed_concurrency == 2
+
+
+@pytest.mark.asyncio
+async def test_scheduler_cadence_is_measured_from_previous_cycle_start(
+    database: Database,
+    search_data: SearchCreateData,
+) -> None:
+    search = await database.create_search(search_data)
+    provider = FakeListingProvider(delay_seconds=0.02)
+    provider.set_results(search.id, [])
+    scheduler = Scheduler(
+        database=database,
+        provider=provider,
+        notification_service=FakeNotificationService(),
+        health=HealthState(),
+        cycle_interval_seconds=0.08,
+        max_concurrent_requests=1,
+    )
+
+    scheduler.start()
+    try:
+        async with asyncio.timeout(1):
+            await provider.wait_for_call_count(3)
+    finally:
+        await scheduler.stop()
+
+    intervals = [
+        later - earlier
+        for earlier, later in zip(
+            provider.call_started_at[:2],
+            provider.call_started_at[1:3],
+            strict=True,
+        )
+    ]
+    assert all(0.055 <= interval < 0.12 for interval in intervals)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error_type",
+    [RequestTimeoutError, RateLimitedError, AccessDeniedError, ChallengeDetectedError],
+)
+async def test_expected_provider_errors_do_not_destroy_scheduler(
+    error_type: type[Exception],
+    database: Database,
+    search_data: SearchCreateData,
+    provider: FakeListingProvider,
+    scheduler_factory: Callable[..., Scheduler],
+) -> None:
+    search = await database.create_search(search_data)
+    provider.set_error(search.id, error_type("simulated"))
+    health = HealthState()
+    scheduler = scheduler_factory(health=health)
+
+    await scheduler.run_cycle()
+    provider.set_results(search.id, [])
+    await scheduler.run_cycle()
+
+    refreshed = await database.get_search(search.id)
+    assert health.total_cycle_count == 2
+    assert health.failed_cycle_count == 0
+    assert health.last_successful_cycle_at is not None
+    assert refreshed is not None
+    assert refreshed.consecutive_errors == 0
+    assert refreshed.baseline_initialized is True

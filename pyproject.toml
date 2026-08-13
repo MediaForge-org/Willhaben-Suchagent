@@ -1,0 +1,42 @@
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[project]
+name = "willhaben-suchagent"
+version = "0.1.0"
+description = "Local live search agent foundation for public willhaben.at listings"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "aiosqlite>=0.20,<1",
+  "fastapi>=0.115,<1",
+  "httpx>=0.28,<1",
+  "pydantic>=2.10,<3",
+  "pydantic-settings>=2.7,<3",
+  "uvicorn[standard]>=0.34,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3,<10",
+  "pytest-asyncio>=0.25,<2",
+  "ruff>=0.9,<1",
+]
+
+[project.scripts]
+willhaben-suchagent = "agent.app.main:run"
+
+[tool.hatch.build.targets.wheel]
+packages = ["agent"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["agent/tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC"]

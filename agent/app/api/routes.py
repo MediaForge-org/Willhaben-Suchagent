@@ -1,0 +1,105 @@
+from fastapi import APIRouter, HTTPException, Request, Response, status
+
+from agent.app.api.schemas import (
+    HealthResponse,
+    SearchCreate,
+    SearchPatch,
+    SearchResponse,
+    StatusResponse,
+)
+from agent.app.storage.database import Database, SearchCreateData
+
+router = APIRouter()
+
+
+def get_database(request: Request) -> Database:
+    return request.app.state.database
+
+
+@router.get("/health", response_model=HealthResponse, tags=["health"])
+async def health(request: Request) -> HealthResponse:
+    database = get_database(request)
+    state = request.app.state.health
+    active_searches = len(await database.list_searches(enabled_only=True))
+    return HealthResponse(
+        status=state.status,
+        process_started_at=state.process_started_at,
+        last_cycle_started_at=state.last_cycle_started_at,
+        last_successful_cycle_at=state.last_successful_cycle_at,
+        active_searches=active_searches,
+        total_cycle_count=state.total_cycle_count,
+        failed_cycle_count=state.failed_cycle_count,
+    )
+
+
+@router.get("/api/v1/status", response_model=StatusResponse, tags=["health"])
+async def application_status(request: Request) -> StatusResponse:
+    base = await health(request)
+    state = request.app.state.health
+    settings = request.app.state.settings
+    return StatusResponse(
+        **base.model_dump(),
+        environment=settings.app_environment,
+        scheduler_running=state.scheduler_running,
+        cycle_interval_seconds=settings.cycle_interval_seconds,
+        max_concurrent_requests=settings.max_concurrent_requests,
+        last_cycle_duration_seconds=state.last_cycle_duration_seconds,
+        last_cycle_error=state.last_cycle_error,
+        last_provider_errors=state.last_provider_errors,
+        database_counts=await get_database(request).status_counts(),
+    )
+
+
+@router.get("/api/v1/searches", response_model=list[SearchResponse], tags=["searches"])
+async def list_searches(request: Request) -> list[SearchResponse]:
+    searches = await get_database(request).list_searches()
+    return [SearchResponse.model_validate(item.model_dump()) for item in searches]
+
+
+@router.post(
+    "/api/v1/searches",
+    response_model=SearchResponse,
+    status_code=status.HTTP_201_CREATED,
+    tags=["searches"],
+)
+async def create_search(payload: SearchCreate, request: Request) -> SearchResponse:
+    created = await get_database(request).create_search(SearchCreateData(**payload.model_dump()))
+    return SearchResponse.model_validate(created.model_dump())
+
+
+@router.get("/api/v1/searches/{search_id}", response_model=SearchResponse, tags=["searches"])
+async def get_search(search_id: int, request: Request) -> SearchResponse:
+    search = await get_database(request).get_search(search_id)
+    if search is None:
+        raise HTTPException(status_code=404, detail="Search not found")
+    return SearchResponse.model_validate(search.model_dump())
+
+
+@router.patch("/api/v1/searches/{search_id}", response_model=SearchResponse, tags=["searches"])
+async def update_search(
+    search_id: int,
+    payload: SearchPatch,
+    request: Request,
+) -> SearchResponse:
+    changes = payload.model_dump(exclude_unset=True)
+    required_fields = {"name", "category", "enabled", "query", "category_filters"}
+    if any(value is None for key, value in changes.items() if key in required_fields):
+        raise HTTPException(status_code=422, detail="Field may not be null")
+    try:
+        updated = await get_database(request).update_search(search_id, changes)
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    if updated is None:
+        raise HTTPException(status_code=404, detail="Search not found")
+    return SearchResponse.model_validate(updated.model_dump())
+
+
+@router.delete(
+    "/api/v1/searches/{search_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    tags=["searches"],
+)
+async def delete_search(search_id: int, request: Request) -> Response:
+    if not await get_database(request).delete_search(search_id):
+        raise HTTPException(status_code=404, detail="Search not found")
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
