@@ -1,1 +1,5 @@
-"""Willhaben provider boundary; real HTTP/parser implementation starts after M1."""
+"""Willhaben-specific providers and public response processing."""
+
+from agent.app.willhaben.marketplace_provider import WillhabenMarketplaceProvider
+
+__all__ = ["WillhabenMarketplaceProvider"]

@@ -14,7 +14,7 @@ from agent.app.core.provider import ListingProvider
 from agent.app.core.scheduler import Scheduler
 from agent.app.notifications.service import FakeNotificationService, NotificationService
 from agent.app.storage.database import Database
-from agent.app.willhaben.fake_provider import FakeListingProvider
+from agent.app.willhaben.marketplace_provider import WillhabenMarketplaceProvider
 
 
 def create_app(
@@ -23,7 +23,13 @@ def create_app(
     notification_service: NotificationService | None = None,
 ) -> FastAPI:
     resolved_settings = settings or Settings()
-    resolved_provider = provider or FakeListingProvider()
+    resolved_provider = provider or WillhabenMarketplaceProvider(
+        user_agent=resolved_settings.marketplace_user_agent,
+        connect_timeout_seconds=resolved_settings.marketplace_connect_timeout_seconds,
+        read_timeout_seconds=resolved_settings.marketplace_read_timeout_seconds,
+        max_redirects=resolved_settings.marketplace_max_redirects,
+        max_response_bytes=resolved_settings.marketplace_max_response_bytes,
+    )
     resolved_notifications = notification_service or FakeNotificationService()
     database = Database(resolved_settings.database_path)
     health = HealthState()
@@ -47,7 +53,7 @@ def create_app(
 
     app = FastAPI(
         title="Willhaben-Suchagent",
-        version="0.1.0",
+        version="0.2.0",
         description="Local API for the Willhaben live search agent",
         lifespan=lifespan,
     )

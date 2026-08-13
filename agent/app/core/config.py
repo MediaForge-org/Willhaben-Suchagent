@@ -16,6 +16,13 @@ class Settings(BaseSettings):
     app_environment: Literal["development", "test", "production"] = "development"
     scheduler_enabled: bool = True
     log_level: str = "INFO"
+    marketplace_user_agent: str = (
+        "Willhaben-Suchagent/0.2 (public Marketplace search; no authentication)"
+    )
+    marketplace_connect_timeout_seconds: float = Field(default=10, gt=0)
+    marketplace_read_timeout_seconds: float = Field(default=20, gt=0)
+    marketplace_max_redirects: int = Field(default=3, ge=0, le=10)
+    marketplace_max_response_bytes: int = Field(default=5_000_000, ge=100_000)
 
     model_config = SettingsConfigDict(
         env_prefix="WILLHABEN_",
