@@ -41,6 +41,7 @@ class SearchDefinition(BaseModel):
     price_min: Decimal | None = Field(default=None, ge=0)
     price_max: Decimal | None = Field(default=None, ge=0)
     category_filters: dict[str, Any] = Field(default_factory=dict)
+    default_template_id: int | None = Field(default=None, ge=1)
     baseline_initialized: bool = False
     created_at: datetime
     updated_at: datetime
@@ -63,6 +64,7 @@ class Listing(BaseModel):
 
     provider_listing_id: str = Field(min_length=1, max_length=300)
     title: str = Field(min_length=1, max_length=1000)
+    article_label: str = Field(default="der Artikel", min_length=1, max_length=500)
     price: Decimal | None = Field(default=None, ge=0)
     url: HttpUrl
     image_url: HttpUrl | None = None
@@ -73,6 +75,14 @@ class Listing(BaseModel):
     condition: str | None = Field(default=None, max_length=500)
     enrichment_status: EnrichmentStatus = EnrichmentStatus.NOT_REQUESTED
     attributes: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def populate_article_label(self) -> Listing:
+        if self.article_label == "der Artikel":
+            from agent.app.core.article_label import derive_article_label
+
+            self.article_label = derive_article_label(self.title, self.attributes)
+        return self
 
 
 class ListingEnrichment(BaseModel):
@@ -88,3 +98,15 @@ class ListingEnrichment(BaseModel):
     seller_type: SellerType | None = None
     condition: str | None = Field(default=None, max_length=500)
     attributes: dict[str, Any] = Field(default_factory=dict)
+
+
+class MessageTemplate(BaseModel):
+    """Persistent, user-authored text used only for previews and clipboard copies."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: int
+    name: str = Field(min_length=1, max_length=200)
+    body: str = Field(min_length=1, max_length=10_000)
+    created_at: datetime
+    updated_at: datetime

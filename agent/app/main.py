@@ -90,7 +90,7 @@ def create_app(
 
     app = FastAPI(
         title="Willhaben-Suchagent",
-        version="0.3.1",
+        version="0.4.0",
         description="Local API for the Willhaben live search agent",
         lifespan=lifespan,
     )

@@ -16,6 +16,7 @@ class SearchPayloadBase(BaseModel):
     price_min: Decimal | None = Field(default=None, ge=0)
     price_max: Decimal | None = Field(default=None, ge=0)
     category_filters: dict[str, Any] = Field(default_factory=dict)
+    default_template_id: int | None = Field(default=None, ge=1)
 
     @model_validator(mode="after")
     def validate_price_range(self):
@@ -40,6 +41,7 @@ class SearchPatch(BaseModel):
     price_min: Decimal | None = Field(default=None, ge=0)
     price_max: Decimal | None = Field(default=None, ge=0)
     category_filters: dict[str, Any] | None = None
+    default_template_id: int | None = Field(default=None, ge=1)
 
 
 class SearchResponse(SearchPayloadBase):
@@ -85,6 +87,7 @@ class RecentListingResponse(BaseModel):
     listing_id: int
     provider_listing_id: str
     title: str
+    article_label: str
     price: Decimal | None
     location: str | None
     image_url: str | None
@@ -101,3 +104,47 @@ class RecentListingResponse(BaseModel):
 class NotificationTestResponse(BaseModel):
     status: str
     message: str
+
+
+class TemplateBase(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+    body: str = Field(min_length=1, max_length=10_000)
+
+
+class TemplateCreate(TemplateBase):
+    model_config = ConfigDict(extra="forbid")
+
+
+class TemplatePatch(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str | None = Field(default=None, min_length=1, max_length=200)
+    body: str | None = Field(default=None, min_length=1, max_length=10_000)
+
+
+class TemplateResponse(TemplateBase):
+    id: int
+    created_at: datetime
+    updated_at: datetime
+
+
+class TemplateRenderRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    listing_id: int = Field(ge=1)
+
+
+class TemplateRenderResponse(BaseModel):
+    template_id: int
+    listing_id: int
+    rendered_text: str
+
+
+class MarketplaceOption(BaseModel):
+    label: str
+    value: str
+
+
+class MarketplaceOptionsResponse(BaseModel):
+    categories: list[MarketplaceOption]
+    locations: list[MarketplaceOption]

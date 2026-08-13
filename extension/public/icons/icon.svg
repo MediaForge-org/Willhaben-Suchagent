@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96" role="img" aria-label="Willhaben-Suchagent">
+  <rect width="96" height="96" rx="24" fill="#16844a"/>
+  <path d="M20 28h13l8 37 7-25h12l7 25 8-37h12L75 70H61l-7-24-7 24H33L20 28Z" fill="#fff"/>
+  <circle cx="76" cy="22" r="10" fill="#b9f4d2" stroke="#fff" stroke-width="4"/>
+</svg>

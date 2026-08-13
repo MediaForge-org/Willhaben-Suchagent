@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import re
 import unicodedata
 from dataclasses import dataclass
 from decimal import Decimal
@@ -54,7 +53,28 @@ _CATEGORY_PATHS = {
     "wohnen-haushalt-gastronomie": "wohnen-haushalt-gastronomie-5387",
     "wohnen / haushalt / gastronomie": "wohnen-haushalt-gastronomie-5387",
 }
-_CATEGORY_PATH_PATTERN = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*-[0-9]+")
+
+SUPPORTED_MARKETPLACE_CATEGORIES = (
+    ("Bücher, Filme & Musik", "buecher-filme-musik-387"),
+    ("Computer & Software", "computer-software-5824"),
+    ("Dienstleistungen", "dienstleistungen-537"),
+    ("Freizeit, Instrumente & Kulinarik", "freizeit-instrumente-kulinarik-6462"),
+    ("KFZ-Zubehör & Motorradteile", "kfz-zubehoer-motorradteile-6142"),
+    ("Mode & Accessoires", "mode-accessoires-3275"),
+    ("Smartphones & Telefonie", "smartphones-telefonie-2691"),
+    ("Wohnen, Haushalt & Gastronomie", "wohnen-haushalt-gastronomie-5387"),
+)
+SUPPORTED_MARKETPLACE_LOCATIONS = (
+    "Burgenland",
+    "Kärnten",
+    "Niederösterreich",
+    "Oberösterreich",
+    "Salzburg",
+    "Steiermark",
+    "Tirol",
+    "Vorarlberg",
+    "Wien",
+)
 
 
 class UnsupportedMarketplaceSearch(ValueError):
@@ -125,7 +145,7 @@ class MarketplaceSearchBuilder:
         if path is not None:
             return path
         raw = str(category).strip().casefold()
-        if _CATEGORY_PATH_PATTERN.fullmatch(raw):
+        if raw in _CATEGORY_PATHS.values():
             return raw
         raise UnsupportedMarketplaceSearch(
             "marketplace_category must be a supported name, ID, or SEO category segment"

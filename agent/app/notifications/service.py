@@ -79,7 +79,7 @@ class NtfyNotificationService(NotificationService):
         self._owns_client = client is None
 
     async def notify_new_listing(self, listing: Listing) -> None:
-        parts = [listing.title]
+        parts = [listing.article_label]
         if listing.price is not None:
             parts.append(f"{self._format_price(listing.price)} €")
         if listing.seller_name:

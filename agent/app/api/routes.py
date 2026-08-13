@@ -2,20 +2,32 @@ from fastapi import APIRouter, HTTPException, Query, Request, Response, status
 
 from agent.app.api.schemas import (
     HealthResponse,
+    MarketplaceOption,
+    MarketplaceOptionsResponse,
     NotificationTestResponse,
     RecentListingResponse,
     SearchCreate,
     SearchPatch,
     SearchResponse,
     StatusResponse,
+    TemplateCreate,
+    TemplatePatch,
+    TemplateRenderRequest,
+    TemplateRenderResponse,
+    TemplateResponse,
 )
+from agent.app.core.templates import render_template, validate_template_body
 from agent.app.core.time import utc_now
 from agent.app.notifications.service import (
     NotificationDeliveryError,
     NotificationDisabledError,
     NotificationService,
 )
-from agent.app.storage.database import Database, SearchCreateData
+from agent.app.storage.database import Database, SearchCreateData, TemplateCreateData
+from agent.app.willhaben.marketplace_search import (
+    SUPPORTED_MARKETPLACE_CATEGORIES,
+    SUPPORTED_MARKETPLACE_LOCATIONS,
+)
 
 router = APIRouter()
 
@@ -91,7 +103,11 @@ async def list_searches(request: Request) -> list[SearchResponse]:
     tags=["searches"],
 )
 async def create_search(payload: SearchCreate, request: Request) -> SearchResponse:
-    created = await get_database(request).create_search(SearchCreateData(**payload.model_dump()))
+    database = get_database(request)
+    if payload.default_template_id is not None:
+        if await database.get_template(payload.default_template_id) is None:
+            raise HTTPException(status_code=422, detail="Standard-Template wurde nicht gefunden")
+    created = await database.create_search(SearchCreateData(**payload.model_dump()))
     return SearchResponse.model_validate(created.model_dump())
 
 
@@ -113,8 +129,12 @@ async def update_search(
     required_fields = {"name", "category", "enabled", "query", "category_filters"}
     if any(value is None for key, value in changes.items() if key in required_fields):
         raise HTTPException(status_code=422, detail="Field may not be null")
+    database = get_database(request)
+    template_id = changes.get("default_template_id")
+    if template_id is not None and await database.get_template(template_id) is None:
+        raise HTTPException(status_code=422, detail="Standard-Template wurde nicht gefunden")
     try:
-        updated = await get_database(request).update_search(search_id, changes)
+        updated = await database.update_search(search_id, changes)
     except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
     if updated is None:
@@ -152,6 +172,7 @@ async def recent_listings(
             listing_id=item.id,
             provider_listing_id=item.provider_listing_id,
             title=item.title,
+            article_label=item.article_label,
             price=item.price,
             location=item.location,
             image_url=item.image_url,
@@ -166,6 +187,111 @@ async def recent_listings(
         )
         for item in listings
     ]
+
+
+@router.get(
+    "/api/v1/marketplace/options",
+    response_model=MarketplaceOptionsResponse,
+    tags=["searches"],
+)
+async def marketplace_options() -> MarketplaceOptionsResponse:
+    return MarketplaceOptionsResponse(
+        categories=[
+            MarketplaceOption(label=label, value=value)
+            for label, value in SUPPORTED_MARKETPLACE_CATEGORIES
+        ],
+        locations=[
+            MarketplaceOption(label=location, value=location)
+            for location in SUPPORTED_MARKETPLACE_LOCATIONS
+        ],
+    )
+
+
+def _validate_body_or_422(body: str) -> None:
+    try:
+        validate_template_body(body)
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+
+
+@router.get("/api/v1/templates", response_model=list[TemplateResponse], tags=["templates"])
+async def list_templates(request: Request) -> list[TemplateResponse]:
+    templates = await get_database(request).list_templates()
+    return [TemplateResponse.model_validate(item.model_dump()) for item in templates]
+
+
+@router.post(
+    "/api/v1/templates",
+    response_model=TemplateResponse,
+    status_code=status.HTTP_201_CREATED,
+    tags=["templates"],
+)
+async def create_template(payload: TemplateCreate, request: Request) -> TemplateResponse:
+    _validate_body_or_422(payload.body)
+    template = await get_database(request).create_template(
+        TemplateCreateData(name=payload.name, body=payload.body)
+    )
+    return TemplateResponse.model_validate(template.model_dump())
+
+
+@router.get("/api/v1/templates/{template_id}", response_model=TemplateResponse, tags=["templates"])
+async def get_template(template_id: int, request: Request) -> TemplateResponse:
+    template = await get_database(request).get_template(template_id)
+    if template is None:
+        raise HTTPException(status_code=404, detail="Template not found")
+    return TemplateResponse.model_validate(template.model_dump())
+
+
+@router.patch(
+    "/api/v1/templates/{template_id}", response_model=TemplateResponse, tags=["templates"]
+)
+async def update_template(
+    template_id: int, payload: TemplatePatch, request: Request
+) -> TemplateResponse:
+    changes = payload.model_dump(exclude_unset=True)
+    if not changes:
+        raise HTTPException(status_code=422, detail="Mindestens ein Feld ist erforderlich")
+    if any(value is None for value in changes.values()):
+        raise HTTPException(status_code=422, detail="Feld darf nicht null sein")
+    if "body" in changes:
+        _validate_body_or_422(changes["body"])
+    template = await get_database(request).update_template(template_id, changes)
+    if template is None:
+        raise HTTPException(status_code=404, detail="Template not found")
+    return TemplateResponse.model_validate(template.model_dump())
+
+
+@router.delete(
+    "/api/v1/templates/{template_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    tags=["templates"],
+)
+async def delete_template(template_id: int, request: Request) -> Response:
+    if not await get_database(request).delete_template(template_id):
+        raise HTTPException(status_code=404, detail="Template not found")
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.post(
+    "/api/v1/templates/{template_id}/render",
+    response_model=TemplateRenderResponse,
+    tags=["templates"],
+)
+async def render_message_template(
+    template_id: int, payload: TemplateRenderRequest, request: Request
+) -> TemplateRenderResponse:
+    database = get_database(request)
+    template = await database.get_template(template_id)
+    if template is None:
+        raise HTTPException(status_code=404, detail="Template not found")
+    listing = await database.get_listing(payload.listing_id)
+    if listing is None:
+        raise HTTPException(status_code=404, detail="Listing not found")
+    return TemplateRenderResponse(
+        template_id=template.id,
+        listing_id=payload.listing_id,
+        rendered_text=render_template(template.body, listing),
+    )
 
 
 @router.post(

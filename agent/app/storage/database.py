@@ -12,13 +12,16 @@ from typing import Any
 
 import aiosqlite
 
+from agent.app.core.article_label import derive_article_label
 from agent.app.core.models import (
     EnrichmentStatus,
     Listing,
+    MessageTemplate,
     SearchCategory,
     SearchDefinition,
     SellerType,
 )
+from agent.app.core.templates import DEFAULT_TEMPLATE_BODY, DEFAULT_TEMPLATE_NAME
 from agent.app.core.time import to_db_timestamp
 from agent.app.storage.schema import SCHEMA
 
@@ -33,6 +36,13 @@ class SearchCreateData:
     price_min: Decimal | None
     price_max: Decimal | None
     category_filters: dict[str, Any]
+    default_template_id: int | None = None
+
+
+@dataclass(slots=True)
+class TemplateCreateData:
+    name: str
+    body: str
 
 
 @dataclass(slots=True)
@@ -55,6 +65,7 @@ class RecentListing:
     id: int
     provider_listing_id: str
     title: str
+    article_label: str
     price: Decimal | None
     location: str | None
     image_url: str | None
@@ -81,9 +92,21 @@ class Database:
             await connection.execute("PRAGMA journal_mode = WAL")
             await connection.execute("PRAGMA synchronous = NORMAL")
             await connection.executescript(SCHEMA)
+            await self._migrate_searches(connection)
             await self._migrate_listings(connection)
             await self._migrate_notifications(connection)
+            await self._ensure_default_template(connection)
             await connection.commit()
+
+    @staticmethod
+    async def _migrate_searches(connection: aiosqlite.Connection) -> None:
+        cursor = await connection.execute("PRAGMA table_info(searches)")
+        columns = {row[1] for row in await cursor.fetchall()}
+        if "default_template_id" not in columns:
+            await connection.execute(
+                "ALTER TABLE searches ADD COLUMN default_template_id INTEGER "
+                "REFERENCES message_templates(id) ON DELETE SET NULL"
+            )
 
     @staticmethod
     async def _migrate_listings(connection: aiosqlite.Connection) -> None:
@@ -92,6 +115,7 @@ class Database:
         cursor = await connection.execute("PRAGMA table_info(listings)")
         columns = {row[1] for row in await cursor.fetchall()}
         additions = {
+            "article_label": "TEXT NOT NULL DEFAULT 'der Artikel'",
             "seller_name": "TEXT",
             "seller_type": "TEXT",
             "condition": "TEXT",
@@ -102,6 +126,34 @@ class Database:
                 await connection.execute(
                     f"ALTER TABLE listings ADD COLUMN {name} {definition}"  # noqa: S608
                 )
+        cursor = await connection.execute(
+            "SELECT id, title, attributes_json, article_label FROM listings"
+        )
+        for row in await cursor.fetchall():
+            if row["article_label"] != "der Artikel":
+                continue
+            try:
+                attributes = json.loads(row["attributes_json"] or "{}")
+            except json.JSONDecodeError:
+                attributes = {}
+            await connection.execute(
+                "UPDATE listings SET article_label = ? WHERE id = ?",
+                (derive_article_label(row["title"], attributes), row["id"]),
+            )
+
+    @staticmethod
+    async def _ensure_default_template(connection: aiosqlite.Connection) -> None:
+        cursor = await connection.execute("SELECT COUNT(*) FROM message_templates")
+        row = await cursor.fetchone()
+        if row and row[0] == 0:
+            timestamp = to_db_timestamp()
+            await connection.execute(
+                """
+                INSERT INTO message_templates(name, body, created_at, updated_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (DEFAULT_TEMPLATE_NAME, DEFAULT_TEMPLATE_BODY, timestamp, timestamp),
+            )
 
     @staticmethod
     async def _migrate_notifications(connection: aiosqlite.Connection) -> None:
@@ -157,6 +209,7 @@ class Database:
             last_checked_at=row["last_checked_at"],
             last_success_at=row["last_success_at"],
             consecutive_errors=row["consecutive_errors"],
+            default_template_id=row["default_template_id"],
             **query_data,
         )
 
@@ -167,8 +220,8 @@ class Database:
                 """
                 INSERT INTO searches (
                     name, category, query_json, enabled, baseline_initialized,
-                    created_at, updated_at
-                ) VALUES (?, ?, ?, ?, 0, ?, ?)
+                    created_at, updated_at, default_template_id
+                ) VALUES (?, ?, ?, ?, 0, ?, ?, ?)
                 """,
                 (
                     data.name,
@@ -177,6 +230,7 @@ class Database:
                     int(data.enabled),
                     timestamp,
                     timestamp,
+                    data.default_template_id,
                 ),
             )
             await connection.commit()
@@ -222,6 +276,7 @@ class Database:
             "price_min",
             "price_max",
             "category_filters",
+            "default_template_id",
         }
         merged = current.model_dump()
         merged.update({key: value for key, value in changes.items() if key in domain_fields})
@@ -242,7 +297,7 @@ class Database:
                 """
                 UPDATE searches
                 SET name = ?, category = ?, query_json = ?, enabled = ?,
-                    baseline_initialized = ?, updated_at = ?
+                    baseline_initialized = ?, updated_at = ?, default_template_id = ?
                 WHERE id = ?
                 """,
                 (
@@ -252,6 +307,7 @@ class Database:
                     int(validated.enabled),
                     0 if reset_baseline else int(current.baseline_initialized),
                     timestamp,
+                    validated.default_template_id,
                     search_id,
                 ),
             )
@@ -333,14 +389,17 @@ class Database:
                         await connection.execute(
                             """
                             INSERT INTO listings (
-                                provider_listing_id, title, price, url, image_url,
+                                provider_listing_id, title, article_label, price, url, image_url,
                                 category, location, seller_name, seller_type, condition,
                                 enrichment_status, attributes_json, first_seen_at, last_seen_at
-                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                             ON CONFLICT(provider_listing_id) DO UPDATE SET
                                 title = CASE
                                     WHEN listings.enrichment_status IN ('enriched', 'partial')
                                     THEN listings.title ELSE excluded.title END,
+                                article_label = CASE
+                                    WHEN listings.enrichment_status IN ('enriched', 'partial')
+                                    THEN listings.article_label ELSE excluded.article_label END,
                                 price = CASE
                                     WHEN listings.enrichment_status IN ('enriched', 'partial')
                                     THEN listings.price ELSE excluded.price END,
@@ -360,6 +419,7 @@ class Database:
                             (
                                 listing.provider_listing_id,
                                 listing.title,
+                                listing.article_label,
                                 str(listing.price) if listing.price is not None else None,
                                 str(listing.url),
                                 str(listing.image_url) if listing.image_url else None,
@@ -448,7 +508,8 @@ class Database:
                 """
                 UPDATE listings
                 SET title = ?, price = ?, image_url = ?, location = ?, seller_name = ?,
-                    seller_type = ?, condition = ?, enrichment_status = ?, attributes_json = ?
+                    seller_type = ?, condition = ?, enrichment_status = ?, attributes_json = ?,
+                    article_label = ?
                 WHERE provider_listing_id = ? AND enrichment_status = 'not_requested'
                 """,
                 (
@@ -461,6 +522,7 @@ class Database:
                     listing.condition,
                     listing.enrichment_status.value,
                     json.dumps(listing.attributes, separators=(",", ":"), sort_keys=True),
+                    listing.article_label,
                     listing.provider_listing_id,
                 ),
             )
@@ -484,6 +546,7 @@ class Database:
                     notifications.attempt_count,
                     listings.provider_listing_id,
                     listings.title,
+                    listings.article_label,
                     listings.price,
                     listings.url,
                     listings.image_url,
@@ -509,6 +572,7 @@ class Database:
                 listing=Listing(
                     provider_listing_id=row["provider_listing_id"],
                     title=row["title"],
+                    article_label=row["article_label"],
                     price=Decimal(row["price"]) if row["price"] is not None else None,
                     url=row["url"],
                     image_url=row["image_url"],
@@ -633,6 +697,7 @@ class Database:
                         id=row["id"],
                         provider_listing_id=row["provider_listing_id"],
                         title=row["title"],
+                        article_label=row["article_label"],
                         price=Decimal(row["price"]) if row["price"] is not None else None,
                         location=row["location"],
                         image_url=row["image_url"],
@@ -649,6 +714,98 @@ class Database:
                     )
                 )
         return recent
+
+    async def get_listing(self, listing_id: int) -> Listing | None:
+        async with self._connect() as connection:
+            cursor = await connection.execute("SELECT * FROM listings WHERE id = ?", (listing_id,))
+            row = await cursor.fetchone()
+        if row is None:
+            return None
+        return Listing(
+            provider_listing_id=row["provider_listing_id"],
+            title=row["title"],
+            article_label=row["article_label"],
+            price=Decimal(row["price"]) if row["price"] is not None else None,
+            url=row["url"],
+            image_url=row["image_url"],
+            category=row["category"],
+            location=row["location"],
+            seller_name=row["seller_name"],
+            seller_type=row["seller_type"],
+            condition=row["condition"],
+            enrichment_status=row["enrichment_status"],
+            attributes=json.loads(row["attributes_json"]),
+        )
+
+    @staticmethod
+    def _row_to_template(row: aiosqlite.Row) -> MessageTemplate:
+        return MessageTemplate(
+            id=row["id"],
+            name=row["name"],
+            body=row["body"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+    async def list_templates(self) -> list[MessageTemplate]:
+        async with self._connect() as connection:
+            cursor = await connection.execute("SELECT * FROM message_templates ORDER BY id")
+            rows = await cursor.fetchall()
+        return [self._row_to_template(row) for row in rows]
+
+    async def get_template(self, template_id: int) -> MessageTemplate | None:
+        async with self._connect() as connection:
+            cursor = await connection.execute(
+                "SELECT * FROM message_templates WHERE id = ?", (template_id,)
+            )
+            row = await cursor.fetchone()
+        return self._row_to_template(row) if row else None
+
+    async def create_template(self, data: TemplateCreateData) -> MessageTemplate:
+        timestamp = to_db_timestamp()
+        async with self._write_lock, self._connect() as connection:
+            cursor = await connection.execute(
+                """
+                INSERT INTO message_templates(name, body, created_at, updated_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (data.name, data.body, timestamp, timestamp),
+            )
+            await connection.commit()
+            template_id = cursor.lastrowid
+        if template_id is None:
+            raise RuntimeError("SQLite did not return a template id")
+        template = await self.get_template(template_id)
+        if template is None:
+            raise RuntimeError("Created template could not be reloaded")
+        return template
+
+    async def update_template(
+        self, template_id: int, changes: dict[str, str]
+    ) -> MessageTemplate | None:
+        current = await self.get_template(template_id)
+        if current is None:
+            return None
+        name = changes.get("name", current.name)
+        body = changes.get("body", current.body)
+        timestamp = to_db_timestamp()
+        async with self._write_lock, self._connect() as connection:
+            await connection.execute(
+                """
+                UPDATE message_templates SET name = ?, body = ?, updated_at = ? WHERE id = ?
+                """,
+                (name, body, timestamp, template_id),
+            )
+            await connection.commit()
+        return await self.get_template(template_id)
+
+    async def delete_template(self, template_id: int) -> bool:
+        async with self._write_lock, self._connect() as connection:
+            cursor = await connection.execute(
+                "DELETE FROM message_templates WHERE id = ?", (template_id,)
+            )
+            await connection.commit()
+        return cursor.rowcount > 0
 
     async def count(self, table: str) -> int:
         allowed_tables = {"searches", "listings", "search_matches", "notifications"}

@@ -79,3 +79,8 @@ def test_search_builder_maps_marketplace_category(category: str, path: str) -> N
 def test_search_builder_rejects_unverified_filters() -> None:
     with pytest.raises(UnsupportedMarketplaceSearch):
         MarketplaceSearchBuilder().build(_search(category_filters={"condition": "used"}))
+
+    with pytest.raises(UnsupportedMarketplaceSearch):
+        MarketplaceSearchBuilder().build(
+            _search(category_filters={"marketplace_category": "unbestaetigt-9999"})
+        )

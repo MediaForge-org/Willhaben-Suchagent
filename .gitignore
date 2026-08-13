@@ -37,6 +37,8 @@ dist/
 .DS_Store
 Thumbs.db
 
-# Firefox extension build/runtime artifacts (future milestones)
+# Firefox extension build/runtime artifacts
+extension/node_modules/
+extension/dist/
 extension/web-ext-artifacts/
 extension/.web-extension-id

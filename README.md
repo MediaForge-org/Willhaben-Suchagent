@@ -5,10 +5,11 @@ Marktplatz-Inserate auf willhaben.at. Mehrere aktivierte Suchen teilen sich gena
 globalen Scheduler. Er startet standardmäßig alle 60 Sekunden einen Cycle, begrenzt die
 Provider-Abfragen zentral und sendet global deduplizierte neue Treffer per ntfy aufs Handy.
 
-Der aktuelle Stand ist **Meilenstein M3.1 (Listing-Enrichment + informative ntfy-Pushes)**.
+Der aktuelle Stand ist **Meilenstein M4 (Firefox-Extension + Nachrichten-Templates)**.
 Es werden weder Willhaben-Login noch Accounts, Benutzer-Cookies, CAPTCHA-Umgehung,
 Proxy-/IP-Rotation oder aggressive Retries verwendet. Auto & Motor, Immobilien, Jobs,
-automatische Nachrichten und die Firefox-Extension gehören ausdrücklich nicht zu M3.1.
+automatische Nachrichten sind ausdrücklich nicht implementiert. Templates bereiten nur Text
+vor; der Benutzer kopiert und versendet ihn selbst.
 
 ## Funktionsumfang
 
@@ -30,6 +31,110 @@ automatische Nachrichten und die Firefox-Extension gehören ausdrücklich nicht 
   zum echten Inserat; nicht vorhandene Zeilen entfallen vollständig
 - Test-Push, Recent-Listings-API sowie erweiterter Health-/Status-Endpunkt
 - vollständig offline laufende Tests mit Fake-Providern und HTTP-Mocks
+- Firefox-WebExtension mit Status-Popup und größerem, responsivem Dashboard
+- UI für Marketplace-Suchen, Recent Listings und persistente Nachrichten-Templates
+- serverseitige Vorschau mit sicherer Zwischenablage-Funktion, aber ohne automatisches
+  Einfügen oder Senden
+
+## Firefox-Extension (M4)
+
+Die Extension liegt in `extension/` und ist bewusst leichtgewichtig mit TypeScript, der
+WebExtensions API und DOM-Modulen umgesetzt. Sie enthält keine eigene Datenbank und keinen
+Scraping-Code. Alle Daten und die gesamte Template-/`article_label`-Logik kommen über die
+lokale API `http://127.0.0.1:8000` aus dem Python-Agenten.
+
+Das Popup zeigt Erreichbarkeit, Scheduler-Status, aktive Suchen, letzte/nächste Prüfung und
+den letzten Fund. Das Dashboard bietet Übersicht, Search-CRUD, Aktivieren/Deaktivieren,
+Recent-Listing-Karten, Template-CRUD inklusive Duplizieren, Standard-Template-Zuordnung und
+eine echte, im Backend gerenderte Nachrichtenvorschau mit „Text kopieren“ und „Inserat
+öffnen“. Es gibt kein Content Script und keinen Zugriff auf Cookies, Passwörter, Browser-
+Historie oder Willhaben-Accounts. Die einzigen Berechtigungen sind `clipboardWrite` sowie
+der lokale Host `127.0.0.1:8000` beziehungsweise dessen `localhost`-Alias.
+
+### Extension installieren und bauen
+
+```bash
+cd extension
+npm install
+npm run typecheck
+npm test
+npm run build
+```
+
+Der reproduzierbare Produktions-Build liegt danach in `extension/dist/`. Eine signierte
+`.xpi` und eine öffentliche Mozilla-Veröffentlichung gehören nicht zu M4.
+
+### Template-System und Platzhalter
+
+Templates werden in SQLite in `message_templates` gespeichert (`id`, `name`, `body`,
+`created_at`, `updated_at`). Ist beim Start kein Template vorhanden, wird „Standard“ mit
+folgendem Inhalt angelegt:
+
+```text
+Hallo [Name],
+
+ist [Artikel] noch verfügbar?
+Ich hätte Interesse.
+
+Lg
+```
+
+Unterstützt werden exakt `[Name]`, `[Artikel]`, `[Preis]`, `[Ort]`, `[Zustand]` und `[URL]`.
+Unbekannte Platzhalter weist die API verständlich zurück. `[Preis]` wird ohne unnötige
+Nachkommastellen mit `€` formatiert; `[URL]` ist die echte Detail-URL. Fehlende Werte werden
+als leere Werte eingesetzt. Eine dadurch allein übrig bleibende beschriftete Zeile wie
+`Ort: [Ort]` wird entfernt, Leerzeilen werden normalisiert und Satzzeichen werden bereinigt.
+So wird `Hallo [Name],` ohne Namen zu `Hallo,`. Niemals erscheinen `None`, `null`,
+`undefined` oder unterstützte rohe Platzhalter. Für ein nicht zuverlässig ermittelbares
+`[Artikel]` gilt immer der neutrale Fallback `der Artikel`.
+
+Jede Suche besitzt optional `default_template_id`. Beim Löschen eines verwendeten Templates
+setzt SQLite diese Zuordnung per `ON DELETE SET NULL` sauber zurück. Rendering erfolgt über
+`POST /api/v1/templates/{id}/render` mit einer persistierten Listing-ID – nicht in der
+Extension. Templates werden derzeit bewusst nicht an ntfy angehängt, damit der mobile Push
+mit Artikel, Preis, Verkäufer, Ort, Zustand und Direktlink kompakt bleibt.
+
+### `article_label`-Strategie
+
+`article_label` ist ein providerunabhängiges, persistiertes Listing-Feld. Die Ableitung ist
+deterministisch und verwendet keine generative KI und keinen externen Dienst:
+
+1. öffentliche strukturierte Produkt-, Marken- und Modellattribute;
+2. relevante öffentliche Kategorieattribute (rekursiv in den normalisierten Attributen);
+3. einen konservativ am ersten klaren Titeltrenner (` - `, ` | `, Gedankenstrich)
+   gekürzten Titel; beim eindeutig erkannten iPhone-Muster endet die Bezeichnung nach der
+   Speicherkapazität;
+4. `der Artikel`, wenn nichts Verlässliches übrig bleibt.
+
+Vorhandene M3.1-Listings werden bei der additiven Migration aus ihren gespeicherten
+Attributen beziehungsweise Titeln befüllt. Es werden keine Marken oder Modelle erfunden.
+
+### Manueller Firefox-Test für M4
+
+1. Virtuelle Python-Umgebung aktivieren und den Agenten mit `willhaben-suchagent` starten.
+2. In einem zweiten Terminal `cd extension && npm install && npm run build` ausführen.
+3. Firefox öffnen, `about:debugging#/runtime/this-firefox` aufrufen, „Temporäres Add-on
+   laden …“ wählen und `extension/dist/manifest.json` auswählen.
+4. Das Extension-Symbol anklicken und das Popup öffnen.
+5. „Überwachung aktiv“, die letzte Prüfung und den erreichbaren Agenten prüfen.
+6. „Dashboard öffnen“ wählen und unter „Meine Suchen“ die bestehende ThinkPad-Suche prüfen.
+7. „Templates“ öffnen.
+8. Das automatisch angelegte Template „Standard“ und dessen Inhalt prüfen.
+9. „Neue Inserate“ öffnen und bei einem vorhandenen Listing „Inserat öffnen“ testen.
+10. „Nachricht vorbereiten“ wählen; das Standard-Template muss mit echten Listing-Daten
+    serverseitig gerendert werden.
+11. „Text kopieren“ anklicken und den Inhalt testweise in ein neutrales Textfeld einfügen.
+12. Im selben Dialog „Inserat öffnen“ anklicken; nur die echte Willhaben-Seite wird geöffnet,
+    kein Formular befüllt und nichts gesendet.
+13. Unter „Meine Suchen“ eine Suche deaktivieren und wieder aktivieren; Baseline und Treffer
+    müssen erhalten bleiben.
+14. „+ Neue Suche“ wählen, Name, Suchbegriff, Preise, bestätigte Region/Kategorie, Live-
+    Status und optionales Standard-Template setzen und die Suche erstellen.
+
+Die Extension versucht eine unterbrochene lokale Verbindung alle 30 Sekunden erneut. Bei
+Offline-Zustand bleibt das Dashboard bedienbar und zeigt nur eine verständliche Meldung ohne
+Stacktrace. Firefox vergibt temporär eine dynamische `moz-extension://`-Origin; mit der eng
+begrenzten WebExtension-Hostberechtigung sind keine globalen CORS-Freigaben im Backend nötig.
 
 ## Voraussetzungen und Installation
 
@@ -320,26 +425,30 @@ pytest
 
 ## Architektur und bekannte Grenzen
 
-- `agent/app/api`: lokale CRUD-, Listings-, Notification- und Status-API
-- `agent/app/core`: Konfiguration, Domain-/Enrichment-Modelle, Scheduler und Health-State
+- `agent/app/api`: lokale Search-, Listing-, Template-, Notification- und Status-API
+- `agent/app/core`: Konfiguration, Domain-/Enrichment-Modelle, `article_label`, serverseitiges
+  Template-Rendering, Scheduler und Health-State
 - `agent/app/storage`: SQLite-Schema, Migration und transaktionale Deduplizierung
 - `agent/app/notifications`: providerunabhängiger Vertrag und ntfy-Transport
 - `agent/app/willhaben`: Search Builder, gemeinsamer HTTP-Transport, getrennte Such- und
   Detailparser, Detailclient, Listing-Enricher und echter Provider
+- `extension/src`: API-Client, Online-/Offline-State, Popup, Dashboard und DOM-Komponenten
+- `extension/public/manifest.json`: eng begrenztes Firefox-MV3-Manifest
 
 Der Scheduler kennt keine Willhaben-spezifischen HTML-/JSON-Strukturen. Öffentliche
 Seitenstrukturen können sich ändern; Abweichungen enden kontrolliert mit `ParseError`. ntfy
 und Willhaben müssen für den echten Alltagstest vom lokalen Rechner erreichbar sein.
 
-Beim Start erweitert eine additive SQLite-Migration bestehende M3-Listings um die vier neuen
-Spalten `seller_name`, `seller_type`, `condition` und `enrichment_status`. Bestehende
-Listings, Baselines, Matches und Notifications bleiben erhalten; Altbestände beginnen mit
-`not_requested`, lösen aber ohne neue Notification keinen nachträglichen Detailabruf aus.
+Beim Start erweitert eine additive SQLite-Migration bestehende M3.1-Daten um
+`listings.article_label`, `searches.default_template_id` und die Tabelle
+`message_templates`. Bestehende Listings, Suchen, Baselines, Matches und Notifications
+bleiben erhalten. Das Löschen einer Suche löscht weiterhin nur ihre Matches; das Löschen
+eines Templates setzt Referenzen auf `NULL`.
 
-Die M3.1-API ist zunächst für Entwickler bedienbar. Eine spätere Firefox-Extension kann über
-dieselben Search-, Status- und Recent-Listings-Endpunkte Suchen verwalten, ohne die Scheduler-
-oder Persistenzarchitektur umzubauen. Die gespeicherte echte Listing-URL bleibt die Basis für
-einen späteren, ausdrücklich benutzergesteuerten Kontakt-Workflow; Login oder automatisches
-Anschreiben sind nicht implementiert. Ein normaler Endbenutzer soll langfristig keine
-Terminalbefehle benötigen. **M4 wurde nicht begonnen und ist nicht Bestandteil dieses
-Stands.**
+Bekannte Grenzen von M4: nur der bereits bestätigte MarketplaceProvider ist über die UI
+anlegbar; freie Bezirks-/Umkreissuchen und unbestätigte Kategorien werden nicht angeboten.
+Die öffentliche Willhaben-Seitenstruktur kann sich ändern. Es gibt noch keine Geräte-/
+Benutzerverwaltung, keine Mozilla-Signierung und keine öffentliche Distribution. Die
+Extension speichert keine Daten selbst. Automatisches Einfügen, Klicken oder Senden ist nicht
+implementiert und wird architektonisch nicht vorbereitet. Auto & Motor (M5) wurde nicht
+begonnen.

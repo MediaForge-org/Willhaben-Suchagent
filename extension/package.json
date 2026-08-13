@@ -1,0 +1,19 @@
+{
+  "name": "willhaben-suchagent-firefox",
+  "version": "0.4.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc --noEmit && vite build",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@types/firefox-webext-browser": "120.0.4",
+    "@types/node": "22.10.5",
+    "jsdom": "26.0.0",
+    "typescript": "5.7.3",
+    "vite": "6.4.3",
+    "vitest": "3.2.7"
+  }
+}

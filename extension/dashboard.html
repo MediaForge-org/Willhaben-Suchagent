@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="de">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Willhaben-Suchagent</title>
+    <link rel="stylesheet" href="/src/styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <a class="brand" href="#overview" aria-label="Willhaben-Suchagent Übersicht">
+          <span class="brand-mark">W</span><span>Willhaben<br /><strong>Suchagent</strong></span>
+        </a>
+        <nav id="navigation" aria-label="Hauptnavigation">
+          <a href="#overview" data-view="overview">Übersicht</a>
+          <a href="#searches" data-view="searches">Meine Suchen</a>
+          <a href="#listings" data-view="listings">Neue Inserate</a>
+          <a href="#templates" data-view="templates">Templates</a>
+          <a href="#settings" data-view="settings">Einstellungen</a>
+        </nav>
+        <p class="manual-note">Nachrichten werden nur vorbereitet und niemals automatisch gesendet.</p>
+      </aside>
+      <main class="dashboard-main">
+        <div id="connection-banner" class="connection-banner" hidden></div>
+        <section id="content" tabindex="-1" aria-live="polite"></section>
+      </main>
+    </div>
+    <div id="modal-root"></div>
+    <script type="module" src="/src/dashboard.ts"></script>
+  </body>
+</html>

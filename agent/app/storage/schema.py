@@ -1,6 +1,14 @@
 SCHEMA = """
 PRAGMA foreign_keys = ON;
 
+CREATE TABLE IF NOT EXISTS message_templates (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    body TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS searches (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL,
@@ -13,7 +21,8 @@ CREATE TABLE IF NOT EXISTS searches (
     updated_at TEXT NOT NULL,
     last_checked_at TEXT,
     last_success_at TEXT,
-    consecutive_errors INTEGER NOT NULL DEFAULT 0 CHECK (consecutive_errors >= 0)
+    consecutive_errors INTEGER NOT NULL DEFAULT 0 CHECK (consecutive_errors >= 0),
+    default_template_id INTEGER REFERENCES message_templates(id) ON DELETE SET NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_searches_enabled ON searches(enabled);
@@ -22,6 +31,7 @@ CREATE TABLE IF NOT EXISTS listings (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     provider_listing_id TEXT NOT NULL UNIQUE,
     title TEXT NOT NULL,
+    article_label TEXT NOT NULL DEFAULT 'der Artikel',
     price TEXT,
     url TEXT NOT NULL,
     image_url TEXT,
