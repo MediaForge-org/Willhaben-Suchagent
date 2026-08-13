@@ -4,7 +4,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from agent.app.core.models import SearchCategory
+from agent.app.core.models import EnrichmentStatus, SearchCategory, SellerType
 
 
 class SearchPayloadBase(BaseModel):
@@ -87,6 +87,11 @@ class RecentListingResponse(BaseModel):
     title: str
     price: Decimal | None
     location: str | None
+    image_url: str | None
+    seller_name: str | None
+    seller_type: SellerType | None
+    condition: str | None
+    enrichment_status: EnrichmentStatus
     url: str
     first_seen_at: datetime
     search_ids: list[int]

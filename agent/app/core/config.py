@@ -17,7 +17,7 @@ class Settings(BaseSettings):
     scheduler_enabled: bool = True
     log_level: str = "INFO"
     marketplace_user_agent: str = (
-        "Willhaben-Suchagent/0.3 (public Marketplace search; no authentication)"
+        "Willhaben-Suchagent/0.3.1 (public Marketplace pages; no authentication)"
     )
     marketplace_connect_timeout_seconds: float = Field(default=10, gt=0)
     marketplace_read_timeout_seconds: float = Field(default=20, gt=0)

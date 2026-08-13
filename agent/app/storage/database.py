@@ -12,7 +12,13 @@ from typing import Any
 
 import aiosqlite
 
-from agent.app.core.models import Listing, SearchCategory, SearchDefinition
+from agent.app.core.models import (
+    EnrichmentStatus,
+    Listing,
+    SearchCategory,
+    SearchDefinition,
+    SellerType,
+)
 from agent.app.core.time import to_db_timestamp
 from agent.app.storage.schema import SCHEMA
 
@@ -51,6 +57,11 @@ class RecentListing:
     title: str
     price: Decimal | None
     location: str | None
+    image_url: str | None
+    seller_name: str | None
+    seller_type: SellerType | None
+    condition: str | None
+    enrichment_status: EnrichmentStatus
     url: str
     first_seen_at: datetime
     search_ids: list[int]
@@ -70,8 +81,27 @@ class Database:
             await connection.execute("PRAGMA journal_mode = WAL")
             await connection.execute("PRAGMA synchronous = NORMAL")
             await connection.executescript(SCHEMA)
+            await self._migrate_listings(connection)
             await self._migrate_notifications(connection)
             await connection.commit()
+
+    @staticmethod
+    async def _migrate_listings(connection: aiosqlite.Connection) -> None:
+        """Add M3.1 enrichment fields without replacing an existing M1-M3 database."""
+
+        cursor = await connection.execute("PRAGMA table_info(listings)")
+        columns = {row[1] for row in await cursor.fetchall()}
+        additions = {
+            "seller_name": "TEXT",
+            "seller_type": "TEXT",
+            "condition": "TEXT",
+            "enrichment_status": "TEXT NOT NULL DEFAULT 'not_requested'",
+        }
+        for name, definition in additions.items():
+            if name not in columns:
+                await connection.execute(
+                    f"ALTER TABLE listings ADD COLUMN {name} {definition}"  # noqa: S608
+                )
 
     @staticmethod
     async def _migrate_notifications(connection: aiosqlite.Connection) -> None:
@@ -304,16 +334,27 @@ class Database:
                             """
                             INSERT INTO listings (
                                 provider_listing_id, title, price, url, image_url,
-                                category, location, attributes_json, first_seen_at, last_seen_at
-                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                category, location, seller_name, seller_type, condition,
+                                enrichment_status, attributes_json, first_seen_at, last_seen_at
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                             ON CONFLICT(provider_listing_id) DO UPDATE SET
-                                title = excluded.title,
-                                price = excluded.price,
+                                title = CASE
+                                    WHEN listings.enrichment_status IN ('enriched', 'partial')
+                                    THEN listings.title ELSE excluded.title END,
+                                price = CASE
+                                    WHEN listings.enrichment_status IN ('enriched', 'partial')
+                                    THEN listings.price ELSE excluded.price END,
                                 url = excluded.url,
-                                image_url = excluded.image_url,
+                                image_url = CASE
+                                    WHEN listings.enrichment_status IN ('enriched', 'partial')
+                                    THEN listings.image_url ELSE excluded.image_url END,
                                 category = excluded.category,
-                                location = excluded.location,
-                                attributes_json = excluded.attributes_json,
+                                location = CASE
+                                    WHEN listings.enrichment_status IN ('enriched', 'partial')
+                                    THEN listings.location ELSE excluded.location END,
+                                attributes_json = CASE
+                                    WHEN listings.enrichment_status IN ('enriched', 'partial')
+                                    THEN listings.attributes_json ELSE excluded.attributes_json END,
                                 last_seen_at = excluded.last_seen_at
                             """,
                             (
@@ -324,6 +365,10 @@ class Database:
                                 str(listing.image_url) if listing.image_url else None,
                                 listing.category.value,
                                 listing.location,
+                                listing.seller_name,
+                                listing.seller_type.value if listing.seller_type else None,
+                                listing.condition,
+                                listing.enrichment_status.value,
                                 json.dumps(
                                     listing.attributes,
                                     separators=(",", ":"),
@@ -393,6 +438,42 @@ class Database:
             baseline_initializations=baseline_initializations,
         )
 
+    async def update_listing_enrichment(self, listing: Listing) -> None:
+        """Persist one completed, partial, or failed one-shot enrichment attempt."""
+
+        if listing.enrichment_status is EnrichmentStatus.NOT_REQUESTED:
+            raise ValueError("Enrichment update must have a terminal status")
+        async with self._write_lock, self._connect() as connection:
+            cursor = await connection.execute(
+                """
+                UPDATE listings
+                SET title = ?, price = ?, image_url = ?, location = ?, seller_name = ?,
+                    seller_type = ?, condition = ?, enrichment_status = ?, attributes_json = ?
+                WHERE provider_listing_id = ? AND enrichment_status = 'not_requested'
+                """,
+                (
+                    listing.title,
+                    str(listing.price) if listing.price is not None else None,
+                    str(listing.image_url) if listing.image_url else None,
+                    listing.location,
+                    listing.seller_name,
+                    listing.seller_type.value if listing.seller_type else None,
+                    listing.condition,
+                    listing.enrichment_status.value,
+                    json.dumps(listing.attributes, separators=(",", ":"), sort_keys=True),
+                    listing.provider_listing_id,
+                ),
+            )
+            if cursor.rowcount == 0:
+                cursor = await connection.execute(
+                    "SELECT enrichment_status FROM listings WHERE provider_listing_id = ?",
+                    (listing.provider_listing_id,),
+                )
+                row = await cursor.fetchone()
+                if row is None:
+                    raise RuntimeError("Listing selected for enrichment no longer exists")
+            await connection.commit()
+
     async def list_deliverable_notifications(self) -> list[PendingNotification]:
         async with self._connect() as connection:
             cursor = await connection.execute(
@@ -408,6 +489,10 @@ class Database:
                     listings.image_url,
                     listings.category,
                     listings.location,
+                    listings.seller_name,
+                    listings.seller_type,
+                    listings.condition,
+                    listings.enrichment_status,
                     listings.attributes_json
                 FROM notifications
                 JOIN listings ON listings.id = notifications.listing_id
@@ -429,6 +514,10 @@ class Database:
                     image_url=row["image_url"],
                     category=row["category"],
                     location=row["location"],
+                    seller_name=row["seller_name"],
+                    seller_type=row["seller_type"],
+                    condition=row["condition"],
+                    enrichment_status=row["enrichment_status"],
                     attributes=json.loads(row["attributes_json"]),
                 ),
             )
@@ -546,6 +635,13 @@ class Database:
                         title=row["title"],
                         price=Decimal(row["price"]) if row["price"] is not None else None,
                         location=row["location"],
+                        image_url=row["image_url"],
+                        seller_name=row["seller_name"],
+                        seller_type=(
+                            SellerType(row["seller_type"]) if row["seller_type"] else None
+                        ),
+                        condition=row["condition"],
+                        enrichment_status=EnrichmentStatus(row["enrichment_status"]),
                         url=row["url"],
                         first_seen_at=datetime.fromisoformat(row["first_seen_at"]),
                         search_ids=[match["id"] for match in matches],

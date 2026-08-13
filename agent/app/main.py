@@ -15,6 +15,10 @@ from agent.app.core.provider import ListingProvider
 from agent.app.core.scheduler import Scheduler
 from agent.app.notifications.service import NotificationService, NtfyNotificationService
 from agent.app.storage.database import Database
+from agent.app.willhaben.marketplace_detail_client import WillhabenMarketplaceDetailClient
+from agent.app.willhaben.marketplace_listing_enricher import (
+    WillhabenMarketplaceListingEnricher,
+)
 from agent.app.willhaben.marketplace_provider import WillhabenMarketplaceProvider
 
 logger = logging.getLogger(__name__)
@@ -46,6 +50,17 @@ def create_app(
     )
     database = Database(resolved_settings.database_path)
     health = HealthState()
+    listing_enricher = None
+    if provider is None:
+        listing_enricher = WillhabenMarketplaceListingEnricher(
+            WillhabenMarketplaceDetailClient(
+                user_agent=resolved_settings.marketplace_user_agent,
+                connect_timeout_seconds=resolved_settings.marketplace_connect_timeout_seconds,
+                read_timeout_seconds=resolved_settings.marketplace_read_timeout_seconds,
+                max_redirects=resolved_settings.marketplace_max_redirects,
+                max_response_bytes=resolved_settings.marketplace_max_response_bytes,
+            )
+        )
     scheduler = Scheduler(
         database=database,
         provider=resolved_provider,
@@ -53,6 +68,7 @@ def create_app(
         health=health,
         cycle_interval_seconds=resolved_settings.cycle_interval_seconds,
         max_concurrent_requests=resolved_settings.max_concurrent_requests,
+        listing_enricher=listing_enricher,
     )
 
     @asynccontextmanager
@@ -74,7 +90,7 @@ def create_app(
 
     app = FastAPI(
         title="Willhaben-Suchagent",
-        version="0.3.0",
+        version="0.3.1",
         description="Local API for the Willhaben live search agent",
         lifespan=lifespan,
     )

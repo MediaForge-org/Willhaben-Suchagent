@@ -3,7 +3,7 @@ from collections.abc import Callable
 import httpx
 import pytest
 
-from agent.app.core.models import Listing
+from agent.app.core.models import Listing, SellerType
 from agent.app.notifications.service import (
     NotificationDeliveryError,
     NotificationDisabledError,
@@ -34,7 +34,10 @@ async def test_ntfy_listing_payload_contains_title_message_click_and_token(
             "ntfy-listing",
             title="ThinkPad X1 Carbon",
             url="https://www.willhaben.at/iad/object/123",
-            location="Wien",
+            location="Wien, 22. Bezirk",
+            seller_name="Beispiel Technik GmbH",
+            seller_type=SellerType.COMMERCIAL,
+            condition="Sehr gut",
         )
 
         await service.notify_new_listing(listing)
@@ -45,7 +48,75 @@ async def test_ntfy_listing_payload_contains_title_message_click_and_token(
     assert request.headers["title"] == "Neues Willhaben-Inserat"
     assert request.headers["click"] == "https://www.willhaben.at/iad/object/123"
     assert request.headers["authorization"] == "Bearer secret-token"
-    assert request.content.decode() == ("ThinkPad X1 Carbon\nPreis: 19999.99 €\nStandort: Wien")
+    assert request.content.decode() == (
+        "ThinkPad X1 Carbon\n"
+        "19999.99 €\n"
+        "Anbieter: Beispiel Technik GmbH\n"
+        "Ort: Wien, 22. Bezirk\n"
+        "Zustand: Sehr gut"
+    )
+
+
+@pytest.mark.asyncio
+async def test_ntfy_omits_all_missing_optional_fields_and_null_representations(
+    listing_factory: Callable[..., Listing],
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, request=request)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        service = NtfyNotificationService(
+            enabled=True,
+            base_url="https://ntfy.example.test",
+            topic="private-topic",
+            client=client,
+        )
+        listing = listing_factory(
+            "minimal",
+            title="Nur ein Titel",
+            price=None,
+            location=None,
+            seller_name=None,
+            seller_type=None,
+            condition=None,
+            url="https://www.willhaben.at/iad/object/minimal",
+        )
+
+        await service.notify_new_listing(listing)
+
+    message = requests[0].content.decode()
+    assert message == "Nur ein Titel"
+    assert "none" not in message.casefold()
+    assert "null" not in message.casefold()
+    assert requests[0].headers["click"] == str(listing.url)
+
+
+@pytest.mark.asyncio
+async def test_ntfy_uses_seller_label_for_private_listing(
+    listing_factory: Callable[..., Listing],
+) -> None:
+    requests: list[httpx.Request] = []
+    transport = httpx.MockTransport(
+        lambda request: requests.append(request) or httpx.Response(200, request=request)
+    )
+    async with httpx.AsyncClient(transport=transport) as client:
+        service = NtfyNotificationService(
+            enabled=True,
+            base_url="https://ntfy.example.test",
+            topic="private-topic",
+            client=client,
+        )
+        await service.notify_new_listing(
+            listing_factory(
+                seller_name="Max M.",
+                seller_type=SellerType.PRIVATE,
+            )
+        )
+
+    assert "Verkäufer: Max M." in requests[0].content.decode()
 
 
 @pytest.mark.asyncio

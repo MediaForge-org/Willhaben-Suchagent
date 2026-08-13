@@ -5,6 +5,7 @@ import logging
 from dataclasses import dataclass
 from time import monotonic
 
+from agent.app.core.enrichment import ListingEnricher
 from agent.app.core.exceptions import (
     AccessDeniedError,
     ChallengeDetectedError,
@@ -12,7 +13,7 @@ from agent.app.core.exceptions import (
     RateLimitedError,
 )
 from agent.app.core.health import HealthState
-from agent.app.core.models import Listing, SearchDefinition
+from agent.app.core.models import EnrichmentStatus, Listing, SearchDefinition
 from agent.app.core.provider import ListingProvider
 from agent.app.core.time import utc_now
 from agent.app.notifications.service import NotificationService
@@ -40,10 +41,12 @@ class Scheduler:
         health: HealthState,
         cycle_interval_seconds: float,
         max_concurrent_requests: int,
+        listing_enricher: ListingEnricher | None = None,
     ) -> None:
         self.database = database
         self.provider = provider
         self.notification_service = notification_service
+        self.listing_enricher = listing_enricher
         self.health = health
         self.cycle_interval_seconds = cycle_interval_seconds
         self._semaphore = asyncio.Semaphore(max_concurrent_requests)
@@ -173,6 +176,41 @@ class Scheduler:
             self.health.last_notification_error = None
         return sent_count, failed_count
 
+    async def _enrich_one(self, listing: Listing) -> None:
+        if self.listing_enricher is None:
+            return
+        try:
+            async with self._semaphore:
+                enriched = await self.listing_enricher.enrich(listing)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            logger.warning(
+                "listing_enrichment_failed provider_listing_id=%s error_type=%s",
+                listing.provider_listing_id,
+                type(error).__name__,
+            )
+            enriched = listing.model_copy(update={"enrichment_status": EnrichmentStatus.FAILED})
+        if enriched.enrichment_status is EnrichmentStatus.NOT_REQUESTED:
+            logger.warning(
+                "listing_enrichment_failed provider_listing_id=%s error_type=%s",
+                listing.provider_listing_id,
+                "MissingTerminalStatus",
+            )
+            enriched = enriched.model_copy(update={"enrichment_status": EnrichmentStatus.FAILED})
+        await self.database.update_listing_enrichment(enriched)
+
+    async def _enrich_new_listings(self) -> None:
+        if self.listing_enricher is None:
+            return
+        pending = await self.database.list_deliverable_notifications()
+        candidates = [
+            item.listing
+            for item in pending
+            if item.listing.enrichment_status is EnrichmentStatus.NOT_REQUESTED
+        ]
+        await asyncio.gather(*(self._enrich_one(listing) for listing in candidates))
+
     async def run_cycle(self) -> None:
         started_monotonic = monotonic()
         self.health.last_cycle_started_at = utc_now()
@@ -197,6 +235,7 @@ class Scheduler:
                     successful_results.append((outcome.search, outcome.listings or []))
 
             persistence = await self.database.persist_cycle_results(successful_results)
+            await self._enrich_new_listings()
             sent_count, notification_failures = await self._deliver_pending_notifications()
 
             if searches and not self.health.last_provider_errors:

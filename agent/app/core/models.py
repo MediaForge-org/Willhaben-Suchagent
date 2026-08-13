@@ -15,6 +15,18 @@ class SearchCategory(StrEnum):
     JOBS = "jobs"
 
 
+class SellerType(StrEnum):
+    PRIVATE = "private"
+    COMMERCIAL = "commercial"
+
+
+class EnrichmentStatus(StrEnum):
+    NOT_REQUESTED = "not_requested"
+    ENRICHED = "enriched"
+    PARTIAL = "partial"
+    FAILED = "failed"
+
+
 class SearchDefinition(BaseModel):
     """Provider-independent search definition with extensible category filters."""
 
@@ -56,4 +68,23 @@ class Listing(BaseModel):
     image_url: HttpUrl | None = None
     category: SearchCategory
     location: str | None = Field(default=None, max_length=500)
+    seller_name: str | None = Field(default=None, max_length=500)
+    seller_type: SellerType | None = None
+    condition: str | None = Field(default=None, max_length=500)
+    enrichment_status: EnrichmentStatus = EnrichmentStatus.NOT_REQUESTED
+    attributes: dict[str, Any] = Field(default_factory=dict)
+
+
+class ListingEnrichment(BaseModel):
+    """Provider-independent public fields obtained from one listing detail page."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    title: str | None = Field(default=None, min_length=1, max_length=1000)
+    price: Decimal | None = Field(default=None, ge=0)
+    image_url: HttpUrl | None = None
+    location: str | None = Field(default=None, max_length=500)
+    seller_name: str | None = Field(default=None, max_length=500)
+    seller_type: SellerType | None = None
+    condition: str | None = Field(default=None, max_length=500)
     attributes: dict[str, Any] = Field(default_factory=dict)

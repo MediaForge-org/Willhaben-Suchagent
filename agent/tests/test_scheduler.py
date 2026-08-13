@@ -4,14 +4,16 @@ from dataclasses import replace
 
 import pytest
 
+from agent.app.core.enrichment import ListingEnricher
 from agent.app.core.exceptions import (
     AccessDeniedError,
     ChallengeDetectedError,
+    ParseError,
     RateLimitedError,
     RequestTimeoutError,
 )
 from agent.app.core.health import HealthState
-from agent.app.core.models import Listing
+from agent.app.core.models import EnrichmentStatus, Listing, SellerType
 from agent.app.core.scheduler import Scheduler
 from agent.app.notifications.service import FakeNotificationService, NotificationService
 from agent.app.storage.database import Database, SearchCreateData
@@ -33,6 +35,237 @@ class FlakyNotificationService(NotificationService):
     async def notify_test(self) -> None:
         if self.failing:
             raise RuntimeError("simulated ntfy outage")
+
+
+class TrackingListingEnricher(ListingEnricher):
+    def __init__(self, error: Exception | None = None, delay_seconds: float = 0) -> None:
+        self.error = error
+        self.delay_seconds = delay_seconds
+        self.calls: list[str] = []
+        self.active_requests = 0
+        self.max_observed_concurrency = 0
+
+    async def enrich(self, listing: Listing) -> Listing:
+        self.calls.append(listing.provider_listing_id)
+        self.active_requests += 1
+        self.max_observed_concurrency = max(
+            self.max_observed_concurrency,
+            self.active_requests,
+        )
+        try:
+            if self.delay_seconds:
+                await asyncio.sleep(self.delay_seconds)
+            if self.error is not None:
+                raise self.error
+            return listing.model_copy(
+                update={
+                    "seller_name": "Max M.",
+                    "seller_type": SellerType.PRIVATE,
+                    "condition": "Sehr gut",
+                    "location": "Wien, 22. Bezirk",
+                    "enrichment_status": EnrichmentStatus.ENRICHED,
+                }
+            )
+        finally:
+            self.active_requests -= 1
+
+
+@pytest.mark.asyncio
+async def test_baseline_creates_no_detail_requests(
+    database: Database,
+    search_data: SearchCreateData,
+    provider: FakeListingProvider,
+    scheduler_factory: Callable[..., Scheduler],
+    listing_factory: Callable[..., Listing],
+) -> None:
+    search = await database.create_search(search_data)
+    provider.set_results(
+        search.id,
+        [listing_factory(f"baseline-{index}") for index in range(30)],
+    )
+    enricher = TrackingListingEnricher()
+
+    await scheduler_factory(listing_enricher=enricher).run_cycle()
+
+    assert enricher.calls == []
+    assert await database.count("listings") == 30
+
+
+@pytest.mark.asyncio
+async def test_known_listing_creates_no_detail_request(
+    database: Database,
+    search_data: SearchCreateData,
+    provider: FakeListingProvider,
+    scheduler_factory: Callable[..., Scheduler],
+    listing_factory: Callable[..., Listing],
+) -> None:
+    search = await database.create_search(search_data)
+    known = listing_factory("known-detail")
+    provider.set_results(search.id, [known])
+    enricher = TrackingListingEnricher()
+    scheduler = scheduler_factory(listing_enricher=enricher)
+
+    await scheduler.run_cycle()
+    await scheduler.run_cycle()
+
+    assert enricher.calls == []
+
+
+@pytest.mark.asyncio
+async def test_exactly_one_new_listing_creates_one_detail_request(
+    database: Database,
+    search_data: SearchCreateData,
+    provider: FakeListingProvider,
+    notifications: FakeNotificationService,
+    scheduler_factory: Callable[..., Scheduler],
+    listing_factory: Callable[..., Listing],
+) -> None:
+    search = await database.create_search(search_data)
+    provider.set_results(search.id, [])
+    enricher = TrackingListingEnricher()
+    scheduler = scheduler_factory(listing_enricher=enricher)
+    await scheduler.run_cycle()
+
+    provider.set_results(search.id, [listing_factory("one-new")])
+    await scheduler.run_cycle()
+
+    assert enricher.calls == ["one-new"]
+    assert notifications.notifications[0].seller_name == "Max M."
+
+
+@pytest.mark.asyncio
+async def test_two_new_listings_create_one_controlled_detail_request_each(
+    database: Database,
+    search_data: SearchCreateData,
+    provider: FakeListingProvider,
+    scheduler_factory: Callable[..., Scheduler],
+    listing_factory: Callable[..., Listing],
+) -> None:
+    search = await database.create_search(search_data)
+    provider.set_results(search.id, [])
+    enricher = TrackingListingEnricher()
+    scheduler = scheduler_factory(listing_enricher=enricher)
+    await scheduler.run_cycle()
+
+    provider.set_results(search.id, [listing_factory("new-a"), listing_factory("new-b")])
+    await scheduler.run_cycle()
+
+    assert sorted(enricher.calls) == ["new-a", "new-b"]
+
+
+@pytest.mark.asyncio
+async def test_detail_enrichment_uses_scheduler_concurrency_limit(
+    database: Database,
+    search_data: SearchCreateData,
+    provider: FakeListingProvider,
+    scheduler_factory: Callable[..., Scheduler],
+    listing_factory: Callable[..., Listing],
+) -> None:
+    search = await database.create_search(search_data)
+    provider.set_results(search.id, [])
+    enricher = TrackingListingEnricher(delay_seconds=0.01)
+    scheduler = scheduler_factory(
+        listing_enricher=enricher,
+        max_concurrent_requests=2,
+    )
+    await scheduler.run_cycle()
+    provider.set_results(
+        search.id,
+        [listing_factory(f"limited-{index}") for index in range(5)],
+    )
+
+    await scheduler.run_cycle()
+
+    assert enricher.max_observed_concurrency == 2
+
+
+@pytest.mark.asyncio
+async def test_enriched_listing_is_not_loaded_again(
+    database: Database,
+    search_data: SearchCreateData,
+    provider: FakeListingProvider,
+    scheduler_factory: Callable[..., Scheduler],
+    listing_factory: Callable[..., Listing],
+) -> None:
+    search = await database.create_search(search_data)
+    provider.set_results(search.id, [])
+    enricher = TrackingListingEnricher()
+    scheduler = scheduler_factory(listing_enricher=enricher)
+    await scheduler.run_cycle()
+    new = listing_factory("one-shot")
+    provider.set_results(search.id, [new])
+
+    await scheduler.run_cycle()
+    await scheduler.run_cycle()
+
+    assert enricher.calls == ["one-shot"]
+    recent = await database.list_recent_listings(limit=1)
+    assert recent[0].enrichment_status is EnrichmentStatus.ENRICHED
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "detail_error",
+    [
+        RequestTimeoutError("simulated detail timeout"),
+        ParseError("simulated detail parse failure"),
+        AccessDeniedError("simulated detail 403"),
+        RateLimitedError("simulated detail 429"),
+        ChallengeDetectedError("simulated detail challenge"),
+    ],
+    ids=["timeout", "parse-error", "403", "429", "challenge"],
+)
+async def test_detail_failure_does_not_prevent_push(
+    detail_error: Exception,
+    database: Database,
+    search_data: SearchCreateData,
+    provider: FakeListingProvider,
+    notifications: FakeNotificationService,
+    scheduler_factory: Callable[..., Scheduler],
+    listing_factory: Callable[..., Listing],
+) -> None:
+    search = await database.create_search(search_data)
+    provider.set_results(search.id, [])
+    enricher = TrackingListingEnricher(detail_error)
+    scheduler = scheduler_factory(listing_enricher=enricher)
+    await scheduler.run_cycle()
+    provider.set_results(search.id, [listing_factory("detail-fails")])
+
+    await scheduler.run_cycle()
+
+    assert enricher.calls == ["detail-fails"]
+    assert [item.provider_listing_id for item in notifications.notifications] == ["detail-fails"]
+    assert notifications.notifications[0].enrichment_status is EnrichmentStatus.FAILED
+
+
+@pytest.mark.asyncio
+async def test_failed_enrichment_is_not_retried_while_notification_is_pending(
+    database: Database,
+    search_data: SearchCreateData,
+    provider: FakeListingProvider,
+    scheduler_factory: Callable[..., Scheduler],
+    listing_factory: Callable[..., Listing],
+) -> None:
+    search = await database.create_search(search_data)
+    provider.set_results(search.id, [])
+    enricher = TrackingListingEnricher(RequestTimeoutError("simulated detail timeout"))
+    disabled_notifications = FakeNotificationService()
+    disabled_notifications.enabled = False
+    disabled_notifications.disabled_reason = "test"
+    scheduler = scheduler_factory(
+        listing_enricher=enricher,
+        notification_service=disabled_notifications,
+    )
+    await scheduler.run_cycle()
+    listing = listing_factory("no-detail-retry")
+    provider.set_results(search.id, [listing])
+
+    await scheduler.run_cycle()
+    await scheduler.run_cycle()
+
+    assert enricher.calls == ["no-detail-retry"]
+    recent = (await database.list_recent_listings(limit=1))[0]
+    assert recent.enrichment_status is EnrichmentStatus.FAILED
 
 
 @pytest.mark.asyncio

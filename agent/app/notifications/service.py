@@ -4,7 +4,7 @@ from urllib.parse import quote
 
 import httpx
 
-from agent.app.core.models import Listing
+from agent.app.core.models import Listing, SellerType
 
 
 class NotificationDeliveryError(Exception):
@@ -81,9 +81,14 @@ class NtfyNotificationService(NotificationService):
     async def notify_new_listing(self, listing: Listing) -> None:
         parts = [listing.title]
         if listing.price is not None:
-            parts.append(f"Preis: {self._format_price(listing.price)} €")
+            parts.append(f"{self._format_price(listing.price)} €")
+        if listing.seller_name:
+            label = "Anbieter" if listing.seller_type is SellerType.COMMERCIAL else "Verkäufer"
+            parts.append(f"{label}: {listing.seller_name}")
         if listing.location:
-            parts.append(f"Standort: {listing.location}")
+            parts.append(f"Ort: {listing.location}")
+        if listing.condition:
+            parts.append(f"Zustand: {listing.condition}")
         await self._publish(
             message="\n".join(parts),
             title=self.LISTING_TITLE,

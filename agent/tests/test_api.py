@@ -3,10 +3,13 @@ import pytest
 from fastapi import FastAPI
 
 from agent.app.core.config import Settings
-from agent.app.core.models import SearchCategory
+from agent.app.core.models import EnrichmentStatus, SearchCategory, SellerType
 from agent.app.main import create_app
 from agent.app.notifications.service import FakeNotificationService, NtfyNotificationService
 from agent.app.willhaben.fake_provider import FakeListingProvider
+from agent.app.willhaben.marketplace_listing_enricher import (
+    WillhabenMarketplaceListingEnricher,
+)
 from agent.app.willhaben.marketplace_provider import WillhabenMarketplaceProvider
 
 
@@ -157,6 +160,12 @@ async def test_recent_listings_endpoint_supports_limit_and_search_filter(
         category=SearchCategory.MARKETPLACE,
         title="Notebook",
         url="https://www.willhaben.at/iad/object/recent-second",
+        image_url="https://cache.willhaben.at/test/recent-second.jpg",
+        seller_name="Max M.",
+        seller_type=SellerType.PRIVATE,
+        condition="Sehr gut",
+        location="Wien, 22. Bezirk",
+        enrichment_status=EnrichmentStatus.ENRICHED,
     )
     provider.set_results(first_id, [shared])
     provider.set_results(second_id, [shared, only_second])
@@ -165,7 +174,14 @@ async def test_recent_listings_endpoint_supports_limit_and_search_filter(
     response = await api_client.get("/api/v1/listings/recent", params={"limit": 1})
     assert response.status_code == 200
     assert len(response.json()) == 1
-    assert response.json()[0]["provider_listing_id"] == "recent-second"
+    item = response.json()[0]
+    assert item["provider_listing_id"] == "recent-second"
+    assert item["seller_name"] == "Max M."
+    assert item["seller_type"] == "private"
+    assert item["condition"] == "Sehr gut"
+    assert item["location"] == "Wien, 22. Bezirk"
+    assert item["image_url"] == "https://cache.willhaben.at/test/recent-second.jpg"
+    assert item["enrichment_status"] == "enriched"
 
     filtered = await api_client.get(
         "/api/v1/listings/recent",
@@ -215,6 +231,7 @@ async def test_default_application_uses_real_provider_and_disabled_ntfy(
     app = create_app(settings)
     assert isinstance(app.state.provider, WillhabenMarketplaceProvider)
     assert app.state.scheduler.provider is app.state.provider
+    assert isinstance(app.state.scheduler.listing_enricher, WillhabenMarketplaceListingEnricher)
     assert isinstance(app.state.notification_service, NtfyNotificationService)
     assert app.state.notification_service.enabled is False
 

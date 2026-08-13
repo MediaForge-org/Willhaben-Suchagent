@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from agent.app.core.models import Listing
+from agent.app.core.models import EnrichmentStatus, Listing, SellerType
 from agent.app.storage.database import Database, SearchCreateData
 
 
@@ -40,6 +40,102 @@ async def test_initialize_migrates_m2_notification_table(tmp_path: Path) -> None
         ).fetchone()
     assert {"updated_at", "last_attempt_at", "attempt_count", "last_error"} <= columns
     assert migrated == ("2026-01-01T00:00:00+00:00", 0, None)
+
+
+@pytest.mark.asyncio
+async def test_initialize_migrates_existing_m3_listings_without_data_loss(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "m3.db"
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE listings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                provider_listing_id TEXT NOT NULL UNIQUE,
+                title TEXT NOT NULL,
+                price TEXT,
+                url TEXT NOT NULL,
+                image_url TEXT,
+                category TEXT NOT NULL,
+                location TEXT,
+                attributes_json TEXT NOT NULL DEFAULT '{}',
+                first_seen_at TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO listings(
+                provider_listing_id, title, url, category, location,
+                first_seen_at, last_seen_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "m3-listing",
+                "Bestehendes Inserat",
+                "https://example.test/m3-listing",
+                "marketplace",
+                "Wien",
+                "2026-01-01T00:00:00+00:00",
+                "2026-01-01T00:00:00+00:00",
+            ),
+        )
+
+    await Database(path).initialize()
+
+    with sqlite3.connect(path) as connection:
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(listings)")}
+        migrated = connection.execute(
+            """
+            SELECT provider_listing_id, title, location, seller_name, seller_type,
+                   condition, enrichment_status
+            FROM listings
+            """
+        ).fetchone()
+    assert {"seller_name", "seller_type", "condition", "enrichment_status"} <= columns
+    assert migrated == (
+        "m3-listing",
+        "Bestehendes Inserat",
+        "Wien",
+        None,
+        None,
+        None,
+        "not_requested",
+    )
+
+
+@pytest.mark.asyncio
+async def test_search_upsert_does_not_overwrite_completed_enrichment(
+    database: Database,
+    search_data: SearchCreateData,
+    listing_factory: Callable[..., Listing],
+) -> None:
+    search = await database.create_search(search_data)
+    base = listing_factory("preserve-enrichment", location="Wien")
+    await database.persist_cycle_results([(search, [base])])
+    enriched = base.model_copy(
+        update={
+            "location": "Wien, 22. Bezirk",
+            "seller_name": "Max M.",
+            "seller_type": SellerType.PRIVATE,
+            "condition": "Sehr gut",
+            "enrichment_status": EnrichmentStatus.ENRICHED,
+            "attributes": {"published_at": "2026-08-13T08:05:00Z"},
+        }
+    )
+    await database.update_listing_enrichment(enriched)
+
+    current_search = await database.get_search(search.id)
+    assert current_search is not None
+    await database.persist_cycle_results([(current_search, [base])])
+
+    recent = (await database.list_recent_listings(limit=1))[0]
+    assert recent.location == "Wien, 22. Bezirk"
+    assert recent.seller_name == "Max M."
+    assert recent.condition == "Sehr gut"
+    assert recent.enrichment_status is EnrichmentStatus.ENRICHED
 
 
 @pytest.mark.asyncio

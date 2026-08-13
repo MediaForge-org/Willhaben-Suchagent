@@ -27,6 +27,11 @@ CREATE TABLE IF NOT EXISTS listings (
     image_url TEXT,
     category TEXT NOT NULL,
     location TEXT,
+    seller_name TEXT,
+    seller_type TEXT CHECK (seller_type IS NULL OR seller_type IN ('private', 'commercial')),
+    condition TEXT,
+    enrichment_status TEXT NOT NULL DEFAULT 'not_requested'
+        CHECK (enrichment_status IN ('not_requested', 'enriched', 'partial', 'failed')),
     attributes_json TEXT NOT NULL DEFAULT '{}',
     first_seen_at TEXT NOT NULL,
     last_seen_at TEXT NOT NULL

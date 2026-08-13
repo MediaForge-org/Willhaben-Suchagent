@@ -37,6 +37,8 @@ def settings(tmp_path: Path) -> Settings:
         scheduler_enabled=False,
         cycle_interval_seconds=60,
         max_concurrent_requests=2,
+        ntfy_enabled=False,
+        ntfy_topic=None,
     )
 
 
@@ -76,6 +78,7 @@ def scheduler_factory(
             max_concurrent_requests=int(
                 overrides.get("max_concurrent_requests", settings.max_concurrent_requests)
             ),
+            listing_enricher=overrides.get("listing_enricher"),
         )
 
     return factory
