@@ -10,6 +10,7 @@ from agent.app.core.time import utc_now
 class HealthState:
     process_started_at: datetime = field(default_factory=utc_now)
     last_cycle_started_at: datetime | None = None
+    next_cycle_due_at: datetime | None = None
     last_cycle_completed_at: datetime | None = None
     last_successful_cycle_at: datetime | None = None
     last_successful_willhaben_cycle_at: datetime | None = None

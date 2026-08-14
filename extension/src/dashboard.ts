@@ -1,4 +1,4 @@
-import { ApiClient } from "./api";
+import { RuntimeApiClient } from "./runtime-api";
 import { loadAgentSnapshot } from "./state";
 import type { AgentSnapshot, Listing, MessageTemplate, Search } from "./types";
 import {
@@ -6,16 +6,20 @@ import {
   chooseDefaultTemplate,
   element,
   formatPrice,
+  previewDesktopSound,
   relativeTime,
   renderSearchList,
   renderTemplateList,
 } from "./ui";
 
-const api = new ApiClient();
+const api = new RuntimeApiClient();
 const content = document.querySelector<HTMLElement>("#content")!;
 const banner = document.querySelector<HTMLElement>("#connection-banner")!;
 const modalRoot = document.querySelector<HTMLElement>("#modal-root")!;
 let snapshot: AgentSnapshot | null = null;
+let connectionFailure:
+  | { reason: "agent_unreachable" | "native_host_missing" | "native_host_start"; message: string }
+  | null = null;
 
 type View = "overview" | "searches" | "listings" | "templates" | "settings";
 
@@ -48,13 +52,20 @@ async function refresh(showLoading = true): Promise<void> {
   if (showLoading) content.replaceChildren(element("div", "loading", "Daten werden geladen …"));
   const connection = await loadAgentSnapshot(api);
   if (!connection.online) {
+    connectionFailure = connection;
     banner.hidden = false;
     banner.textContent = snapshot
-      ? "Verbindung unterbrochen. Die zuletzt geladenen Daten bleiben sichtbar; neuer Versuch in 30 Sekunden."
-      : "Der Willhaben-Suchagent läuft derzeit nicht. Neuer Versuch in 30 Sekunden.";
+      ? `${connection.message} Die zuletzt geladenen Daten bleiben sichtbar; neuer Versuch in 30 Sekunden.`
+      : `${connection.message} Neuer Versuch in 30 Sekunden.`;
   } else {
+    connectionFailure = null;
     snapshot = connection.data;
-    banner.hidden = true;
+    const failedEndpoints = Object.keys(snapshot.endpointErrors);
+    banner.hidden = failedEndpoints.length === 0;
+    if (failedEndpoints.length) {
+      banner.textContent =
+        "Agent erreichbar. Einzelne Bereiche konnten nicht geladen werden; neuer Versuch in 30 Sekunden.";
+    }
   }
   renderView();
 }
@@ -66,10 +77,23 @@ function renderView(): void {
     const retry = element("button", "button primary", "Erneut versuchen");
     retry.addEventListener("click", () => void refresh());
     const offline = element("section", "offline-panel");
+    const nativeHostMissing = connectionFailure?.reason === "native_host_missing";
+    const nativeHostStart = connectionFailure?.reason === "native_host_start";
     offline.append(
       element("div", "offline-icon", "!"),
-      element("h1", "", "Agent nicht erreichbar"),
-      element("p", "", "Der lokale Hintergrunddienst scheint nicht zu laufen. Sobald er wieder verfügbar ist, erscheinen deine Suchen und Inserate hier automatisch."),
+      element(
+        "h1",
+        "",
+        nativeHostMissing || nativeHostStart
+          ? "Lokale Verbindung fehlt"
+          : "Agent nicht erreichbar",
+      ),
+      element(
+        "p",
+        "",
+        connectionFailure?.message ??
+          "Der lokale Hintergrunddienst scheint nicht zu laufen.",
+      ),
       retry,
     );
     content.replaceChildren(offline);
@@ -92,9 +116,9 @@ function renderOverview(): void {
   fragment.append(pageHeader("Guten Tag", "Hier siehst du, was dein Suchagent gerade macht."));
   const stats = element("div", "stats-grid");
   const values = [
-    [String(data.status.active_searches), "Aktive Suchen"],
-    [data.status.scheduler_running ? "Aktiv" : "Pausiert", "Überwachung"],
-    [relativeTime(data.status.last_cycle_completed_at), "Letzte Prüfung"],
+    [data.status ? String(data.status.active_searches) : "–", "Aktive Suchen"],
+    [data.status ? (data.status.scheduler_running ? "Aktiv" : "Pausiert") : "Unbekannt", "Überwachung"],
+    [data.status ? relativeTime(data.status.last_cycle_completed_at) : "nicht verfügbar", "Letzte Prüfung"],
     [String(data.listings.length), "Letzte Inserate"],
   ];
   for (const [value, label] of values) {
@@ -161,8 +185,7 @@ function listingGrid(listings: Listing[], allowMessage: boolean): HTMLElement {
       card.append(element("div", "listing-image placeholder", "Kein Bild"));
     }
     const body = element("div", "listing-body");
-    body.append(element("h3", "", listing.article_label));
-    if (listing.title !== listing.article_label) body.append(element("p", "listing-title", listing.title));
+    body.append(element("h3", "", listing.title));
     body.append(element("strong", "price", formatPrice(listing.price)));
     const sellerLabel = listing.seller_type === "commercial" ? "Anbieter" : "Verkäufer";
     body.append(
@@ -210,11 +233,107 @@ function renderTemplates(): void {
 
 function renderSettings(): void {
   const safety = element("section", "card settings-card");
+  const soundStatus = snapshot!.status;
+  const soundSettings = snapshot!.settings;
   safety.append(
     element("h2", "", "Lokaler Agent"),
-    element("p", "", "API-Adresse"),
-    element("code", "api-address", "http://127.0.0.1:8000"),
-    element("p", "subtle", "Die Extension greift nur auf diesen lokalen Dienst zu. Sie benötigt weder Willhaben-Login noch Cookies oder Passwörter."),
+    element("p", "", "Verbindung über Firefox Native Messaging"),
+    element("code", "api-address", "at.willhaben_suchagent.bridge"),
+    element("p", "subtle", "Die Extension spricht ausschließlich mit der installierten lokalen Bridge. Sie benötigt weder Willhaben-Login noch Cookies oder Passwörter."),
+    element("h2", "", "Desktop-Sound"),
+  );
+  if (!soundSettings) {
+    safety.append(
+      element("p", "subtle", "Soundeinstellungen sind derzeit nicht verfügbar."),
+    );
+  } else {
+    const controls = element("div", "sound-settings");
+    const enabled = input("desktop_sound_enabled", "", "checkbox");
+    enabled.checked = soundSettings.desktop_sound_enabled;
+    const enabledLabel = field("Sound EIN/AUS", enabled);
+    const badge = element(
+      "span",
+      `badge ${enabled.checked ? "success" : "muted"}`,
+      enabled.checked ? "EIN" : "AUS",
+    );
+    enabledLabel.append(badge);
+    const soundSelect = select(
+      "desktop_sound_id",
+      soundSettings.desktop_sounds.map((sound) => ({
+        label: sound.name,
+        value: sound.id,
+      })),
+      soundSettings.desktop_sound_id,
+    );
+    const testSound = element("button", "button secondary", "Ton testen");
+    testSound.type = "button";
+    const result = element("p", "subtle");
+    const persist = async (payload: {
+      desktop_sound_enabled?: boolean;
+      desktop_sound_id?: string;
+    }) => {
+      enabled.disabled = true;
+      soundSelect.disabled = true;
+      testSound.disabled = true;
+      result.textContent = "Einstellung wird gespeichert …";
+      try {
+        snapshot!.settings = await api.updateSettings(payload);
+        if (snapshot!.status) {
+          snapshot!.status.desktop_sound_enabled =
+            snapshot!.settings.desktop_sound_enabled;
+          snapshot!.status.desktop_sound_id = snapshot!.settings.desktop_sound_id;
+        }
+        renderSettings();
+      } catch (error) {
+        enabled.checked = snapshot!.settings!.desktop_sound_enabled;
+        soundSelect.value = snapshot!.settings!.desktop_sound_id;
+        result.textContent =
+          error instanceof Error ? error.message : "Einstellung konnte nicht gespeichert werden.";
+        enabled.disabled = false;
+        soundSelect.disabled = false;
+        testSound.disabled = false;
+      }
+    };
+    enabled.addEventListener("change", () => {
+      void persist({ desktop_sound_enabled: enabled.checked });
+    });
+    soundSelect.addEventListener("change", () => {
+      void persist({ desktop_sound_id: soundSelect.value });
+    });
+    testSound.addEventListener("click", async () => {
+      testSound.disabled = true;
+      result.textContent = "Sound wird abgespielt …";
+      try {
+        const response = await previewDesktopSound(api, soundSelect.value);
+        result.textContent = response.message;
+      } catch (error) {
+        result.textContent =
+          error instanceof Error ? error.message : "Soundtest ist fehlgeschlagen.";
+      } finally {
+        testSound.disabled = false;
+      }
+    });
+    controls.append(
+      enabledLabel,
+      field("Benachrichtigungston", soundSelect),
+      testSound,
+      result,
+    );
+    safety.append(
+      controls,
+      element(
+        "p",
+        "subtle",
+        !soundSettings.desktop_sound_enabled
+          ? "Desktop-Sound ist ausgeschaltet; Ton testen bleibt als manuelle Vorschau möglich."
+          : soundStatus?.desktop_sound_available
+            ? "Bei neuen Inseraten spielt der Agent maximal einmal pro Cycle den gewählten Ton."
+            : soundStatus?.desktop_sound_disabled_reason ??
+                "Die Audio-Ausgabe ist derzeit nicht verfügbar.",
+      ),
+    );
+  }
+  safety.append(
     element("h2", "", "Nachrichten bleiben manuell"),
     element("p", "", "Die Extension rendert Text im Agenten, kopiert ihn auf Wunsch und öffnet das Inserat. Sie füllt kein Willhaben-Formular aus und klickt niemals auf Senden."),
   );
@@ -338,7 +457,8 @@ function openSearchEditor(search?: Search): void {
 }
 
 const placeholders = [
-  ["[Name]", "Verkäufer/Anbieter"], ["[Artikel]", "kurze Artikelbezeichnung"],
+  ["[Name]", "Verkäufer/Anbieter"], ["[Artikel]", "natürliche Artikelphrase"],
+  ["[Artikelname]", "Artikelbezeichnung ohne der/die/das"],
   ["[Preis]", "Preis"], ["[Ort]", "Standort"], ["[Zustand]", "Zustand"], ["[URL]", "Inserat-Link"],
 ] as const;
 
@@ -362,7 +482,7 @@ function openTemplateEditor(template?: MessageTemplate, seed?: { name: string; b
     chips.append(chip);
   }
   const info = element("div", "template-help");
-  info.append(element("h3", "", "Verfügbare Platzhalter"), chips, element("p", "subtle", "Fehlende Angaben werden vom Agenten sauber entfernt; für [Artikel] wird „der Artikel“ verwendet."));
+  info.append(element("h3", "", "Verfügbare Platzhalter"), chips, element("p", "subtle", "[Artikel] enthält eine natürliche deutsche Artikelphrase; [Artikelname] nur die Produktbezeichnung. Bei unsicherem Produkttyp wird für [Artikel] „der Artikel“ verwendet."));
   const error = element("p", "form-error");
   const actions = element("div", "actions form-actions");
   const cancel = element("button", "button secondary", "Abbrechen");
@@ -391,7 +511,7 @@ function openTemplateEditor(template?: MessageTemplate, seed?: { name: string; b
 }
 
 function openMessageDialog(listing: Listing): void {
-  const { body } = modal(`Nachricht für ${listing.article_label}`);
+  const { body } = modal(`Nachricht für ${listing.title}`);
   if (!snapshot!.templates.length) {
     body.append(element("p", "empty-state", "Lege zuerst ein Template an."));
     return;

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
+from datetime import timedelta
 from time import monotonic
 
 from agent.app.core.enrichment import ListingEnricher
@@ -17,6 +18,10 @@ from agent.app.core.models import EnrichmentStatus, Listing, SearchDefinition
 from agent.app.core.provider import ListingProvider
 from agent.app.core.time import utc_now
 from agent.app.notifications.service import NotificationService
+from agent.app.notifications.sound import (
+    DesktopNotificationSoundService,
+    NullDesktopNotificationSoundService,
+)
 from agent.app.storage.database import Database
 
 logger = logging.getLogger(__name__)
@@ -42,11 +47,13 @@ class Scheduler:
         cycle_interval_seconds: float,
         max_concurrent_requests: int,
         listing_enricher: ListingEnricher | None = None,
+        desktop_sound_service: DesktopNotificationSoundService | None = None,
     ) -> None:
         self.database = database
         self.provider = provider
         self.notification_service = notification_service
         self.listing_enricher = listing_enricher
+        self.desktop_sound_service = desktop_sound_service or NullDesktopNotificationSoundService()
         self.health = health
         self.cycle_interval_seconds = cycle_interval_seconds
         self._semaphore = asyncio.Semaphore(max_concurrent_requests)
@@ -58,6 +65,7 @@ class Scheduler:
             return
         self._stop_event.clear()
         self.health.scheduler_running = True
+        self.health.next_cycle_due_at = utc_now()
         self._task = asyncio.create_task(self._run_loop(), name="global-search-scheduler")
 
     async def stop(self) -> None:
@@ -70,18 +78,18 @@ class Scheduler:
             except asyncio.CancelledError:
                 pass
             self._task = None
+        self.health.next_cycle_due_at = None
 
     async def _run_loop(self) -> None:
         try:
             while not self._stop_event.is_set():
-                cycle_started_monotonic = monotonic()
                 try:
                     await self.run_cycle()
                 except asyncio.CancelledError:
                     raise
                 except Exception:
                     logger.exception("cycle_unhandled_failure")
-                next_start = cycle_started_monotonic + self.cycle_interval_seconds
+                next_start = monotonic() + self.cycle_interval_seconds
                 delay = max(0.0, next_start - monotonic())
                 try:
                     await asyncio.wait_for(self._stop_event.wait(), timeout=delay)
@@ -213,7 +221,8 @@ class Scheduler:
 
     async def run_cycle(self) -> None:
         started_monotonic = monotonic()
-        self.health.last_cycle_started_at = utc_now()
+        cycle_started_at = utc_now()
+        self.health.last_cycle_started_at = cycle_started_at
         self.health.total_cycle_count += 1
         self.health.last_cycle_error = None
         self.health.last_provider_errors = {}
@@ -235,6 +244,16 @@ class Scheduler:
                     successful_results.append((outcome.search, outcome.listings or []))
 
             persistence = await self.database.persist_cycle_results(successful_results)
+            if persistence.created_notification_count > 0 and self.desktop_sound_service.enabled:
+                try:
+                    await self.desktop_sound_service.play_new_listing_chime()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:
+                    logger.warning(
+                        "desktop_sound_failed error=%s",
+                        type(error).__name__,
+                    )
             await self._enrich_new_listings()
             sent_count, notification_failures = await self._deliver_pending_notifications()
 
@@ -261,7 +280,11 @@ class Scheduler:
             raise
         finally:
             duration = monotonic() - started_monotonic
-            self.health.last_cycle_completed_at = utc_now()
+            cycle_completed_at = utc_now()
+            self.health.last_cycle_completed_at = cycle_completed_at
+            self.health.next_cycle_due_at = cycle_completed_at + timedelta(
+                seconds=self.cycle_interval_seconds
+            )
             self.health.last_cycle_duration_seconds = duration
             logger.info(
                 "cycle_completed cycle=%s duration_seconds=%.3f",

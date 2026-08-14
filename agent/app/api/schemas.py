@@ -58,6 +58,7 @@ class HealthResponse(BaseModel):
     status: str
     process_started_at: datetime
     last_cycle_started_at: datetime | None
+    next_cycle_due_at: datetime | None
     last_cycle_completed_at: datetime | None
     last_successful_cycle_at: datetime | None
     last_successful_willhaben_cycle_at: datetime | None
@@ -80,6 +81,10 @@ class StatusResponse(HealthResponse):
     last_successful_notification_at: datetime | None
     ntfy_enabled: bool
     ntfy_disabled_reason: str | None
+    desktop_sound_enabled: bool
+    desktop_sound_id: str
+    desktop_sound_available: bool
+    desktop_sound_disabled_reason: str | None
     database_counts: dict[str, int]
 
 
@@ -88,6 +93,7 @@ class RecentListingResponse(BaseModel):
     provider_listing_id: str
     title: str
     article_label: str
+    article_phrase: str
     price: Decimal | None
     location: str | None
     image_url: str | None
@@ -104,6 +110,35 @@ class RecentListingResponse(BaseModel):
 class NotificationTestResponse(BaseModel):
     status: str
     message: str
+
+
+class DesktopSoundTestResponse(BaseModel):
+    status: str
+    message: str
+
+
+class DesktopSoundOption(BaseModel):
+    id: str
+    name: str
+
+
+class AgentSettingsResponse(BaseModel):
+    desktop_sound_enabled: bool
+    desktop_sound_id: str
+    desktop_sounds: list[DesktopSoundOption]
+
+
+class AgentSettingsPatch(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    desktop_sound_enabled: bool | None = None
+    desktop_sound_id: str | None = Field(default=None, min_length=1, max_length=50)
+
+
+class DesktopSoundTestRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    desktop_sound_id: str | None = Field(default=None, min_length=1, max_length=50)
 
 
 class TemplateBase(BaseModel):

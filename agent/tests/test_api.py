@@ -6,6 +6,7 @@ from agent.app.core.config import Settings
 from agent.app.core.models import EnrichmentStatus, SearchCategory, SellerType
 from agent.app.main import create_app
 from agent.app.notifications.service import FakeNotificationService, NtfyNotificationService
+from agent.app.notifications.sound import FakeDesktopNotificationSoundService
 from agent.app.willhaben.fake_provider import FakeListingProvider
 from agent.app.willhaben.marketplace_listing_enricher import (
     WillhabenMarketplaceListingEnricher,
@@ -95,12 +96,28 @@ async def test_detailed_status_endpoint(api_client: httpx.AsyncClient) -> None:
     assert body["failed_notifications"] == 0
     assert body["last_successful_notification_at"] is None
     assert body["ntfy_enabled"] is True
+    assert body["desktop_sound_enabled"] is False
+    assert body["desktop_sound_id"] == "notify"
+    assert body["desktop_sound_available"] is False
+    assert body["desktop_sound_disabled_reason"] == "Desktop sound is disabled"
     assert body["database_counts"] == {
         "searches": 0,
         "listings": 0,
         "search_matches": 0,
         "notifications": 0,
     }
+
+
+@pytest.mark.asyncio
+async def test_status_and_recent_listing_reads_do_not_call_provider(
+    api_client: httpx.AsyncClient,
+    provider: FakeListingProvider,
+) -> None:
+    await api_client.get("/api/v1/status")
+    await api_client.get("/api/v1/status")
+    await api_client.get("/api/v1/listings/recent", params={"limit": 1})
+
+    assert provider.calls == []
 
 
 @pytest.mark.asyncio
@@ -244,6 +261,127 @@ async def test_default_application_uses_real_provider_and_disabled_ntfy(
     assert response.status_code == 503
     assert status_response.json()["ntfy_enabled"] is False
     assert status_response.json()["ntfy_disabled_reason"] == "NTFY_ENABLED is false"
+
+
+@pytest.mark.asyncio
+async def test_development_desktop_sound_endpoint_plays_without_listing(
+    settings: Settings,
+) -> None:
+    sound = FakeDesktopNotificationSoundService()
+    app = create_app(
+        settings.model_copy(update={"app_environment": "development"}),
+        FakeListingProvider(),
+        FakeNotificationService(),
+        sound,
+    )
+
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            response = await client.post("/api/v1/desktop-sound/test")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "played", "message": "Notify wurde abgespielt"}
+    assert sound.preview_count == 1
+    assert await app.state.database.count("listings") == 0
+
+
+@pytest.mark.asyncio
+async def test_desktop_sound_test_previews_selected_sound_even_when_notifications_are_off(
+    settings: Settings,
+) -> None:
+    sound = FakeDesktopNotificationSoundService(enabled=False)
+    app = create_app(
+        settings.model_copy(update={"app_environment": "development"}),
+        FakeListingProvider(),
+        FakeNotificationService(),
+        sound,
+    )
+
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            response = await client.post(
+                "/api/v1/desktop-sound/test",
+                json={"desktop_sound_id": "pop"},
+            )
+
+    assert response.status_code == 200
+    assert sound.play_count == 0
+    assert sound.previewed_sound_ids == ["pop"]
+
+
+@pytest.mark.asyncio
+async def test_desktop_sound_settings_are_mutable_and_reject_invalid_ids(
+    settings: Settings,
+) -> None:
+    sound = FakeDesktopNotificationSoundService(enabled=False)
+    app = create_app(settings, FakeListingProvider(), FakeNotificationService(), sound)
+
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            initial = await client.get("/api/v1/settings")
+            changed = await client.patch(
+                "/api/v1/settings",
+                json={"desktop_sound_enabled": True, "desktop_sound_id": "ping"},
+            )
+            rejected = await client.patch(
+                "/api/v1/settings",
+                json={"desktop_sound_id": "signal"},
+            )
+            persisted = await client.get("/api/v1/settings")
+
+    assert initial.json()["desktop_sound_enabled"] is False
+    assert [item["id"] for item in initial.json()["desktop_sounds"]] == [
+        "notify",
+        "ping",
+        "pop",
+    ]
+    assert changed.status_code == 200
+    assert changed.json()["desktop_sound_enabled"] is True
+    assert changed.json()["desktop_sound_id"] == "ping"
+    assert sound.enabled is True
+    assert sound.sound_id == "ping"
+    assert rejected.status_code == 422
+    assert persisted.json()["desktop_sound_id"] == "ping"
+
+
+@pytest.mark.asyncio
+async def test_desktop_sound_settings_survive_agent_restart(settings: Settings) -> None:
+    first_sound = FakeDesktopNotificationSoundService(enabled=False)
+    first = create_app(settings, FakeListingProvider(), FakeNotificationService(), first_sound)
+    async with first.router.lifespan_context(first):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=first),
+            base_url="http://test",
+        ) as client:
+            response = await client.patch(
+                "/api/v1/settings",
+                json={"desktop_sound_enabled": True, "desktop_sound_id": "pop"},
+            )
+            assert response.status_code == 200
+
+    restarted_sound = FakeDesktopNotificationSoundService(enabled=False)
+    restarted = create_app(
+        settings,
+        FakeListingProvider(),
+        FakeNotificationService(),
+        restarted_sound,
+    )
+    async with restarted.router.lifespan_context(restarted):
+        preferences = await restarted.state.database.get_desktop_sound_preferences()
+
+    assert preferences.enabled is True
+    assert preferences.sound_id == "pop"
+    assert restarted_sound.enabled is True
+    assert restarted_sound.sound_id == "pop"
 
 
 @pytest.mark.asyncio

@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from decimal import Decimal
 
-from agent.app.core.article_label import FALLBACK_ARTICLE_LABEL
+from agent.app.core.article_label import FALLBACK_ARTICLE_LABEL, FALLBACK_ARTICLE_PHRASE
 from agent.app.core.models import Listing
 
 DEFAULT_TEMPLATE_NAME = "Standard"
@@ -16,7 +16,8 @@ Lg"""
 
 SUPPORTED_PLACEHOLDERS = {
     "[Name]": "Verkäufer/Anbieter",
-    "[Artikel]": "kurze Artikelbezeichnung",
+    "[Artikel]": "natürliche Artikelphrase",
+    "[Artikelname]": "Artikelbezeichnung ohne der/die/das",
     "[Preis]": "Preis",
     "[Ort]": "Standort",
     "[Zustand]": "Zustand",
@@ -37,7 +38,8 @@ def render_template(body: str, listing: Listing) -> str:
     validate_template_body(body)
     values = {
         "[Name]": _clean(listing.seller_name),
-        "[Artikel]": _clean(listing.article_label) or FALLBACK_ARTICLE_LABEL,
+        "[Artikel]": _article_value(listing),
+        "[Artikelname]": _clean(listing.article_label) or FALLBACK_ARTICLE_LABEL,
         "[Preis]": _format_price(listing.price),
         "[Ort]": _clean(listing.location),
         "[Zustand]": _clean(listing.condition),
@@ -59,6 +61,16 @@ def render_template(body: str, listing: Listing) -> str:
             rendered_line = ""
         rendered_lines.append(rendered_line)
     return _normalize_missing_values("\n".join(rendered_lines))
+
+
+def _article_value(listing: Listing) -> str:
+    phrase = _clean(listing.article_phrase)
+    label = _clean(listing.article_label)
+    if phrase not in {"", FALLBACK_ARTICLE_LABEL, FALLBACK_ARTICLE_PHRASE}:
+        return phrase
+    if label not in {"", FALLBACK_ARTICLE_LABEL, FALLBACK_ARTICLE_PHRASE}:
+        return label
+    return FALLBACK_ARTICLE_PHRASE
 
 
 def _clean(value: str | None) -> str:

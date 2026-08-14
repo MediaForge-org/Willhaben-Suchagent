@@ -15,6 +15,8 @@ class Settings(BaseSettings):
     api_port: int = Field(default=8000, ge=1, le=65535)
     app_environment: Literal["development", "test", "production"] = "development"
     scheduler_enabled: bool = True
+    desktop_sound_enabled: bool = True
+    desktop_sound_id: Literal["notify", "ping", "pop"] = "notify"
     log_level: str = "INFO"
     marketplace_user_agent: str = (
         "Willhaben-Suchagent/0.3.1 (public Marketplace pages; no authentication)"

@@ -18,6 +18,7 @@ from agent.app.core.models import Listing, SearchCategory
 from agent.app.core.scheduler import Scheduler
 from agent.app.main import create_app
 from agent.app.notifications.service import FakeNotificationService
+from agent.app.notifications.sound import FakeDesktopNotificationSoundService
 from agent.app.storage.database import Database, SearchCreateData
 from agent.app.willhaben.fake_provider import FakeListingProvider
 
@@ -39,6 +40,7 @@ def settings(tmp_path: Path) -> Settings:
         max_concurrent_requests=2,
         ntfy_enabled=False,
         ntfy_topic=None,
+        desktop_sound_enabled=False,
     )
 
 
@@ -60,11 +62,17 @@ def notifications() -> FakeNotificationService:
 
 
 @pytest.fixture
+def desktop_sound() -> FakeDesktopNotificationSoundService:
+    return FakeDesktopNotificationSoundService()
+
+
+@pytest.fixture
 def scheduler_factory(
     database: Database,
     provider: FakeListingProvider,
     notifications: FakeNotificationService,
     settings: Settings,
+    desktop_sound: FakeDesktopNotificationSoundService,
 ) -> Callable[..., Scheduler]:
     def factory(**overrides: object) -> Scheduler:
         return Scheduler(
@@ -79,6 +87,7 @@ def scheduler_factory(
                 overrides.get("max_concurrent_requests", settings.max_concurrent_requests)
             ),
             listing_enricher=overrides.get("listing_enricher"),
+            desktop_sound_service=overrides.get("desktop_sound_service", desktop_sound),
         )
 
     return factory

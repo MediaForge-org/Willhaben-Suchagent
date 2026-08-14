@@ -16,6 +16,7 @@ from agent.app.core.health import HealthState
 from agent.app.core.models import EnrichmentStatus, Listing, SellerType
 from agent.app.core.scheduler import Scheduler
 from agent.app.notifications.service import FakeNotificationService, NotificationService
+from agent.app.notifications.sound import FakeDesktopNotificationSoundService
 from agent.app.storage.database import Database, SearchCreateData
 from agent.app.willhaben.fake_provider import FakeListingProvider
 
@@ -401,7 +402,7 @@ async def test_all_searches_share_one_cycle_and_concurrency_is_limited(
 
 
 @pytest.mark.asyncio
-async def test_scheduler_cadence_is_measured_from_previous_cycle_start(
+async def test_scheduler_cadence_is_measured_from_previous_cycle_completion(
     database: Database,
     search_data: SearchCreateData,
 ) -> None:
@@ -432,7 +433,21 @@ async def test_scheduler_cadence_is_measured_from_previous_cycle_start(
             strict=True,
         )
     ]
-    assert all(0.055 <= interval < 0.12 for interval in intervals)
+    assert all(0.085 <= interval < 0.14 for interval in intervals)
+
+
+@pytest.mark.asyncio
+async def test_completed_cycle_publishes_authoritative_next_due_time(
+    scheduler_factory: Callable[..., Scheduler],
+) -> None:
+    health = HealthState()
+    scheduler = scheduler_factory(health=health, cycle_interval_seconds=60)
+
+    await scheduler.run_cycle()
+
+    assert health.last_cycle_completed_at is not None
+    assert health.next_cycle_due_at is not None
+    assert (health.next_cycle_due_at - health.last_cycle_completed_at).total_seconds() == 60
 
 
 @pytest.mark.asyncio
@@ -552,10 +567,12 @@ async def test_restart_retries_failed_notification_without_duplicate_listing(
     restarted_provider = FakeListingProvider()
     restarted_provider.set_results(search.id, [])
     restarted_notifications = FakeNotificationService()
+    restarted_sound = FakeDesktopNotificationSoundService()
     restarted_scheduler = Scheduler(
         database=restarted_database,
         provider=restarted_provider,
         notification_service=restarted_notifications,
+        desktop_sound_service=restarted_sound,
         health=HealthState(),
         cycle_interval_seconds=60,
         max_concurrent_requests=2,
@@ -565,6 +582,7 @@ async def test_restart_retries_failed_notification_without_duplicate_listing(
     assert [item.provider_listing_id for item in restarted_notifications.notifications] == [
         "survives-restart"
     ]
+    assert restarted_sound.play_count == 0
     assert await restarted_database.count("listings") == 1
     notification = await restarted_database.notification_status("survives-restart")
     assert notification is not None
@@ -634,3 +652,161 @@ async def test_reactivated_initialized_search_only_notifies_unknown_listing(
     assert [item.provider_listing_id for item in notifications.notifications] == [
         "new-after-reactivation"
     ]
+
+
+@pytest.mark.asyncio
+async def test_baseline_listing_plays_no_desktop_sound(
+    database: Database,
+    search_data: SearchCreateData,
+    provider: FakeListingProvider,
+    scheduler_factory: Callable[..., Scheduler],
+    listing_factory: Callable[..., Listing],
+) -> None:
+    search = await database.create_search(search_data)
+    provider.set_results(search.id, [listing_factory("sound-baseline")])
+    sound = FakeDesktopNotificationSoundService()
+
+    await scheduler_factory(desktop_sound_service=sound).run_cycle()
+
+    assert sound.play_count == 0
+
+
+@pytest.mark.asyncio
+async def test_known_listing_plays_no_desktop_sound(
+    database: Database,
+    search_data: SearchCreateData,
+    provider: FakeListingProvider,
+    scheduler_factory: Callable[..., Scheduler],
+    listing_factory: Callable[..., Listing],
+) -> None:
+    search = await database.create_search(search_data)
+    provider.set_results(search.id, [listing_factory("sound-known")])
+    sound = FakeDesktopNotificationSoundService()
+    scheduler = scheduler_factory(desktop_sound_service=sound)
+
+    await scheduler.run_cycle()
+    await scheduler.run_cycle()
+
+    assert sound.play_count == 0
+
+
+@pytest.mark.asyncio
+async def test_one_new_listing_plays_exactly_one_desktop_sound(
+    database: Database,
+    search_data: SearchCreateData,
+    provider: FakeListingProvider,
+    scheduler_factory: Callable[..., Scheduler],
+    listing_factory: Callable[..., Listing],
+) -> None:
+    search = await database.create_search(search_data)
+    provider.set_results(search.id, [])
+    sound = FakeDesktopNotificationSoundService()
+    scheduler = scheduler_factory(desktop_sound_service=sound)
+    await scheduler.run_cycle()
+
+    provider.set_results(search.id, [listing_factory("sound-new")])
+    await scheduler.run_cycle()
+
+    assert sound.play_count == 1
+
+
+@pytest.mark.asyncio
+async def test_multiple_new_listings_play_one_desktop_sound_per_cycle(
+    database: Database,
+    search_data: SearchCreateData,
+    provider: FakeListingProvider,
+    scheduler_factory: Callable[..., Scheduler],
+    listing_factory: Callable[..., Listing],
+) -> None:
+    search = await database.create_search(search_data)
+    provider.set_results(search.id, [])
+    sound = FakeDesktopNotificationSoundService()
+    scheduler = scheduler_factory(desktop_sound_service=sound)
+    await scheduler.run_cycle()
+
+    provider.set_results(
+        search.id,
+        [listing_factory("sound-a"), listing_factory("sound-b")],
+    )
+    await scheduler.run_cycle()
+
+    assert sound.play_count == 1
+
+
+@pytest.mark.asyncio
+async def test_desktop_sound_failure_does_not_fail_scheduler_cycle(
+    database: Database,
+    search_data: SearchCreateData,
+    provider: FakeListingProvider,
+    scheduler_factory: Callable[..., Scheduler],
+    listing_factory: Callable[..., Listing],
+) -> None:
+    search = await database.create_search(search_data)
+    provider.set_results(search.id, [])
+    sound = FakeDesktopNotificationSoundService(failing=True)
+    health = HealthState()
+    scheduler = scheduler_factory(desktop_sound_service=sound, health=health)
+    await scheduler.run_cycle()
+    provider.set_results(search.id, [listing_factory("sound-fails")])
+
+    await scheduler.run_cycle()
+
+    assert sound.play_count == 1
+    assert health.failed_cycle_count == 0
+    assert await database.count("listings") == 1
+
+
+@pytest.mark.asyncio
+async def test_disabled_desktop_sound_is_not_called(
+    database: Database,
+    search_data: SearchCreateData,
+    provider: FakeListingProvider,
+    scheduler_factory: Callable[..., Scheduler],
+    listing_factory: Callable[..., Listing],
+) -> None:
+    search = await database.create_search(search_data)
+    provider.set_results(search.id, [])
+    sound = FakeDesktopNotificationSoundService(enabled=False)
+    scheduler = scheduler_factory(desktop_sound_service=sound)
+    await scheduler.run_cycle()
+    provider.set_results(search.id, [listing_factory("sound-disabled")])
+
+    await scheduler.run_cycle()
+
+    assert sound.play_count == 0
+
+
+@pytest.mark.asyncio
+async def test_restart_does_not_play_sound_for_old_listing(
+    database: Database,
+    search_data: SearchCreateData,
+    provider: FakeListingProvider,
+    scheduler_factory: Callable[..., Scheduler],
+    listing_factory: Callable[..., Listing],
+) -> None:
+    search = await database.create_search(search_data)
+    listing = listing_factory("sound-before-restart")
+    provider.set_results(search.id, [])
+    scheduler = scheduler_factory()
+    await scheduler.run_cycle()
+    provider.set_results(search.id, [listing])
+    await scheduler.run_cycle()
+
+    restarted_database = Database(database.path)
+    await restarted_database.initialize()
+    restarted_provider = FakeListingProvider()
+    restarted_provider.set_results(search.id, [listing])
+    restarted_sound = FakeDesktopNotificationSoundService()
+    restarted_scheduler = Scheduler(
+        database=restarted_database,
+        provider=restarted_provider,
+        notification_service=FakeNotificationService(),
+        desktop_sound_service=restarted_sound,
+        health=HealthState(),
+        cycle_interval_seconds=60,
+        max_concurrent_requests=2,
+    )
+
+    await restarted_scheduler.run_cycle()
+
+    assert restarted_sound.play_count == 0

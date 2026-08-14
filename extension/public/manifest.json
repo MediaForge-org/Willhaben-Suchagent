@@ -16,11 +16,14 @@
     "page": "dashboard.html",
     "open_in_tab": true
   },
-  "permissions": ["clipboardWrite"],
-  "host_permissions": [
-    "http://127.0.0.1:8000/*",
-    "http://localhost:8000/*"
-  ],
+  "background": {
+    "scripts": ["background.js"],
+    "type": "module"
+  },
+  "permissions": ["clipboardWrite", "nativeMessaging"],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'none'"
+  },
   "browser_specific_settings": {
     "gecko": {
       "id": "willhaben-suchagent@local",

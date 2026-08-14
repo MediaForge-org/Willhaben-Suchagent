@@ -1,3 +1,4 @@
+import type { ApiService } from "./api-contract";
 import type { Listing, MessageTemplate, Search } from "./types";
 
 export function element<K extends keyof HTMLElementTagNameMap>(
@@ -13,12 +14,17 @@ export function element<K extends keyof HTMLElementTagNameMap>(
 
 export function formatPrice(value: string | null): string {
   if (value === null) return "Preis nicht angegeben";
-  return `${new Intl.NumberFormat("de-AT", { maximumFractionDigits: 2 }).format(Number(value))} €`;
+  const price = Number(value);
+  if (!Number.isFinite(price)) return "Preis nicht angegeben";
+  return `${new Intl.NumberFormat("de-AT", { maximumFractionDigits: 2 }).format(price)} €`;
 }
 
-export function relativeTime(value: string | null): string {
+export function relativeTime(value: string | null, now = Date.now()): string {
   if (!value) return "noch nicht";
-  const seconds = Math.max(0, Math.round((Date.now() - new Date(value).getTime()) / 1000));
+  const timestamp = new Date(value).getTime();
+  if (Number.isNaN(timestamp)) return "noch nicht";
+  const seconds = Math.max(0, Math.round((now - timestamp) / 1000));
+  if (seconds < 5) return "gerade eben";
   if (seconds < 60) return `vor ${seconds} Sekunde${seconds === 1 ? "" : "n"}`;
   const minutes = Math.round(seconds / 60);
   if (minutes < 60) return `vor ${minutes} Minute${minutes === 1 ? "" : "n"}`;
@@ -101,6 +107,13 @@ export async function copyPreparedMessage(
   clipboard: TextClipboard = navigator.clipboard,
 ): Promise<void> {
   await clipboard.writeText(text);
+}
+
+export function previewDesktopSound(
+  api: Pick<ApiService, "testDesktopSound">,
+  soundId: string,
+): Promise<{ status: string; message: string }> {
+  return api.testDesktopSound(soundId);
 }
 
 export function chooseDefaultTemplate(

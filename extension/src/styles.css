@@ -79,6 +79,11 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .settings-card { padding: 28px; max-width: 780px; }
 .settings-card h2:not(:first-child) { margin-top: 32px; }
 .api-address { display: inline-block; background: var(--surface-soft); padding: 10px 12px; border-radius: 8px; }
+.sound-settings { display: grid; grid-template-columns: minmax(150px, .7fr) minmax(210px, 1fr) auto; gap: 16px; align-items: end; margin-top: 16px; }
+.sound-settings .field:first-child { grid-template-columns: 1fr auto; align-items: center; }
+.sound-settings .field:first-child > span:first-child { grid-column: 1 / -1; }
+.sound-settings .field input[type="checkbox"] { width: 22px; height: 22px; margin: 8px 0; }
+.sound-settings .subtle { grid-column: 1 / -1; margin: 0; }
 
 .modal-backdrop { position: fixed; inset: 0; z-index: 20; background: rgb(7 18 13 / 58%); display: grid; place-items: center; padding: 24px; }
 .modal { background: var(--surface); border-radius: 16px; width: min(720px, 100%); max-height: calc(100vh - 48px); overflow: auto; box-shadow: 0 25px 80px rgb(0 0 0 / 30%); }
@@ -147,4 +152,5 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
   .stats-grid { grid-template-columns: 1fr 1fr; }
   .modal-backdrop { padding: 0; }
   .modal { height: 100vh; max-height: none; border-radius: 0; }
+  .sound-settings { grid-template-columns: 1fr; align-items: stretch; }
 }

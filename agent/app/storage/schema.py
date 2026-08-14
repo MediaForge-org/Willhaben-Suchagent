@@ -31,7 +31,8 @@ CREATE TABLE IF NOT EXISTS listings (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     provider_listing_id TEXT NOT NULL UNIQUE,
     title TEXT NOT NULL,
-    article_label TEXT NOT NULL DEFAULT 'der Artikel',
+    article_label TEXT NOT NULL DEFAULT 'Artikel',
+    article_phrase TEXT NOT NULL DEFAULT 'der Artikel',
     price TEXT,
     url TEXT NOT NULL,
     image_url TEXT,
@@ -67,4 +68,9 @@ CREATE TABLE IF NOT EXISTS notifications (
 );
 
 CREATE INDEX IF NOT EXISTS idx_notifications_status ON notifications(status);
+
+CREATE TABLE IF NOT EXISTS agent_settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 """

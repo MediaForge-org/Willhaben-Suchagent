@@ -1,14 +1,21 @@
 export interface AgentStatus {
+  environment: "development" | "test" | "production";
   status: "ok" | "degraded";
   scheduler_running: boolean;
   active_searches: number;
+  total_cycle_count: number;
   cycle_interval_seconds: number;
   last_cycle_started_at: string | null;
+  next_cycle_due_at: string | null;
   last_cycle_completed_at: string | null;
   last_successful_willhaben_cycle_at: string | null;
   last_provider_errors: Record<string, string>;
   pending_notifications: number;
   failed_notifications: number;
+  desktop_sound_enabled: boolean;
+  desktop_sound_id: string;
+  desktop_sound_available: boolean;
+  desktop_sound_disabled_reason: string | null;
 }
 
 export interface Search {
@@ -33,6 +40,7 @@ export interface Listing {
   provider_listing_id: string;
   title: string;
   article_label: string;
+  article_phrase: string;
   price: string | null;
   location: string | null;
   image_url: string | null;
@@ -58,10 +66,26 @@ export interface MarketplaceOptions {
   locations: Array<{ label: string; value: string }>;
 }
 
+export interface AgentSettings {
+  desktop_sound_enabled: boolean;
+  desktop_sound_id: string;
+  desktop_sounds: Array<{ id: string; name: string }>;
+}
+
 export interface AgentSnapshot {
-  status: AgentStatus;
+  status: AgentStatus | null;
   searches: Search[];
   listings: Listing[];
   templates: MessageTemplate[];
   options: MarketplaceOptions;
+  settings: AgentSettings | null;
+  endpointErrors: Partial<Record<AgentEndpoint, string>>;
 }
+
+export type AgentEndpoint =
+  | "status"
+  | "searches"
+  | "listings"
+  | "templates"
+  | "options"
+  | "settings";

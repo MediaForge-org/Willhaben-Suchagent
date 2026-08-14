@@ -64,7 +64,8 @@ class Listing(BaseModel):
 
     provider_listing_id: str = Field(min_length=1, max_length=300)
     title: str = Field(min_length=1, max_length=1000)
-    article_label: str = Field(default="der Artikel", min_length=1, max_length=500)
+    article_label: str = Field(default="Artikel", min_length=1, max_length=500)
+    article_phrase: str = Field(default="der Artikel", min_length=1, max_length=504)
     price: Decimal | None = Field(default=None, ge=0)
     url: HttpUrl
     image_url: HttpUrl | None = None
@@ -77,11 +78,21 @@ class Listing(BaseModel):
     attributes: dict[str, Any] = Field(default_factory=dict)
 
     @model_validator(mode="after")
-    def populate_article_label(self) -> Listing:
-        if self.article_label == "der Artikel":
-            from agent.app.core.article_label import derive_article_label
+    def populate_article_text(self) -> Listing:
+        from agent.app.core.article_label import (
+            FALLBACK_ARTICLE_LABEL,
+            FALLBACK_ARTICLE_PHRASE,
+            derive_article_label,
+            derive_article_phrase,
+        )
 
+        if self.article_label in {FALLBACK_ARTICLE_LABEL, FALLBACK_ARTICLE_PHRASE}:
             self.article_label = derive_article_label(self.title, self.attributes)
+        self.article_phrase = derive_article_phrase(
+            self.article_label,
+            self.title,
+            self.attributes,
+        )
         return self
 
 

@@ -7,7 +7,7 @@
     "strict": true,
     "noUncheckedIndexedAccess": true,
     "lib": ["ES2022", "DOM", "DOM.Iterable"],
-    "types": ["firefox-webext-browser", "node"]
+    "types": ["firefox-webext-browser", "node", "vite/client"]
   },
   "include": ["src", "vite.config.ts"]
 }

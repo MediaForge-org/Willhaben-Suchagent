@@ -14,6 +14,10 @@ from agent.app.core.logging import configure_logging
 from agent.app.core.provider import ListingProvider
 from agent.app.core.scheduler import Scheduler
 from agent.app.notifications.service import NotificationService, NtfyNotificationService
+from agent.app.notifications.sound import (
+    DesktopNotificationSoundService,
+    create_desktop_sound_service,
+)
 from agent.app.storage.database import Database
 from agent.app.willhaben.marketplace_detail_client import WillhabenMarketplaceDetailClient
 from agent.app.willhaben.marketplace_listing_enricher import (
@@ -28,6 +32,7 @@ def create_app(
     settings: Settings | None = None,
     provider: ListingProvider | None = None,
     notification_service: NotificationService | None = None,
+    desktop_sound_service: DesktopNotificationSoundService | None = None,
 ) -> FastAPI:
     resolved_settings = settings or Settings()
     resolved_provider = provider or WillhabenMarketplaceProvider(
@@ -49,6 +54,10 @@ def create_app(
         timeout_seconds=resolved_settings.ntfy_timeout_seconds,
     )
     database = Database(resolved_settings.database_path)
+    resolved_desktop_sound = desktop_sound_service or create_desktop_sound_service(
+        enabled=resolved_settings.desktop_sound_enabled,
+        sound_id=resolved_settings.desktop_sound_id,
+    )
     health = HealthState()
     listing_enricher = None
     if provider is None:
@@ -69,16 +78,32 @@ def create_app(
         cycle_interval_seconds=resolved_settings.cycle_interval_seconds,
         max_concurrent_requests=resolved_settings.max_concurrent_requests,
         listing_enricher=listing_enricher,
+        desktop_sound_service=resolved_desktop_sound,
     )
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         configure_logging(resolved_settings.log_level)
-        await database.initialize()
+        await database.initialize(
+            desktop_sound_enabled=resolved_settings.desktop_sound_enabled,
+            desktop_sound_id=resolved_settings.desktop_sound_id,
+        )
+        desktop_sound_preferences = await database.get_desktop_sound_preferences()
+        resolved_desktop_sound.configure(
+            enabled=desktop_sound_preferences.enabled,
+            sound_id=desktop_sound_preferences.sound_id,
+        )
         if not resolved_notifications.enabled:
             logger.info(
                 "notification_service_disabled reason=%s",
                 resolved_notifications.disabled_reason,
+            )
+        if not resolved_desktop_sound.enabled:
+            logger.info("desktop_sound_disabled reason=%s", resolved_desktop_sound.disabled_reason)
+        elif not resolved_desktop_sound.available:
+            logger.warning(
+                "desktop_sound_unavailable reason=%s",
+                resolved_desktop_sound.disabled_reason,
             )
         if resolved_settings.scheduler_enabled:
             scheduler.start()
@@ -100,6 +125,7 @@ def create_app(
     app.state.scheduler = scheduler
     app.state.provider = resolved_provider
     app.state.notification_service = resolved_notifications
+    app.state.desktop_sound_service = resolved_desktop_sound
     app.include_router(router)
     return app
 

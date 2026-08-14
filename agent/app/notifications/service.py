@@ -93,6 +93,7 @@ class NtfyNotificationService(NotificationService):
             message="\n".join(parts),
             title=self.LISTING_TITLE,
             click=str(listing.url),
+            priority="high",
         )
 
     async def notify_test(self) -> None:
@@ -101,7 +102,14 @@ class NtfyNotificationService(NotificationService):
             title="Willhaben-Suchagent",
         )
 
-    async def _publish(self, *, message: str, title: str, click: str | None = None) -> None:
+    async def _publish(
+        self,
+        *,
+        message: str,
+        title: str,
+        click: str | None = None,
+        priority: str | None = None,
+    ) -> None:
         if not self.enabled:
             raise NotificationDisabledError(self.disabled_reason or "ntfy is disabled")
         headers = {
@@ -110,6 +118,8 @@ class NtfyNotificationService(NotificationService):
         }
         if click:
             headers["Click"] = click
+        if priority:
+            headers["Priority"] = priority
         if self._token:
             headers["Authorization"] = f"Bearer {self._token}"
         try:

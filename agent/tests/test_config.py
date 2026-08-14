@@ -17,3 +17,12 @@ def test_ntfy_settings_accept_documented_environment_variables(monkeypatch) -> N
     assert settings.ntfy_token.get_secret_value() == "private-token"
     assert settings.ntfy_timeout_seconds == 4.5
     assert "private-token" not in repr(settings)
+
+
+def test_desktop_sound_defaults_on_and_accepts_environment_override(monkeypatch) -> None:
+    assert Settings(_env_file=None).desktop_sound_enabled is True
+    assert Settings(_env_file=None).desktop_sound_id == "notify"
+
+    monkeypatch.setenv("WILLHABEN_DESKTOP_SOUND_ENABLED", "false")
+
+    assert Settings(_env_file=None).desktop_sound_enabled is False

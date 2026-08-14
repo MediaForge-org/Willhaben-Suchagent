@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from agent.app.core.article_label import derive_article_label
+from agent.app.core.article_label import derive_article_label, derive_article_phrase
 from agent.app.core.enrichment import ListingEnricher
 from agent.app.core.models import EnrichmentStatus, Listing, ListingEnrichment, SearchCategory
 from agent.app.willhaben.marketplace_detail_client import WillhabenMarketplaceDetailClient
@@ -39,10 +39,16 @@ class WillhabenMarketplaceListingEnricher(ListingEnricher):
         status = self._status(details)
         merged_attributes = {**listing.attributes, **details.attributes}
         enriched_title = details.title or listing.title
+        article_label = derive_article_label(enriched_title, merged_attributes)
         enriched = listing.model_copy(
             update={
                 "title": enriched_title,
-                "article_label": derive_article_label(enriched_title, merged_attributes),
+                "article_label": article_label,
+                "article_phrase": derive_article_phrase(
+                    article_label,
+                    enriched_title,
+                    merged_attributes,
+                ),
                 "price": details.price if details.price is not None else listing.price,
                 "image_url": details.image_url or listing.image_url,
                 "location": details.location or listing.location,

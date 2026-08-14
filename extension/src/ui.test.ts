@@ -1,6 +1,11 @@
+import { expect, test, vi } from "vitest";
+
 import {
   chooseDefaultTemplate,
   copyPreparedMessage,
+  formatPrice,
+  previewDesktopSound,
+  relativeTime,
   renderSearchList,
   renderTemplateList,
 } from "./ui";
@@ -33,4 +38,22 @@ test("copy workflow writes exactly the rendered backend preview", async () => {
   await copyPreparedMessage("Hallo Max,\n\nist der Artikel verfügbar?", clipboard);
   expect(clipboard.writeText).toHaveBeenCalledWith("Hallo Max,\n\nist der Artikel verfügbar?");
 });
-import { expect, test, vi } from "vitest";
+
+test("invalid optional price and time values use safe display fallbacks", () => {
+  expect(formatPrice("not-a-price")).toBe("Preis nicht angegeben");
+  expect(relativeTime("not-a-date")).toBe("noch nicht");
+});
+
+test("sound preview sends the variant selected by the test button", async () => {
+  const api = {
+    testDesktopSound: vi.fn(async () => ({
+      status: "played",
+      message: "Pop wurde abgespielt",
+    })),
+  };
+
+  await expect(previewDesktopSound(api, "pop")).resolves.toMatchObject({
+    status: "played",
+  });
+  expect(api.testDesktopSound).toHaveBeenCalledExactlyOnceWith("pop");
+});

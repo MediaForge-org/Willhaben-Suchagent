@@ -15,7 +15,7 @@ vor; der Benutzer kopiert und versendet ihn selbst.
 
 - FastAPI-Anwendung mit SQLite-Persistenz und automatischem Lifespan-Start
 - ein globaler Scheduler für alle aktiven Suchen, standardmäßig alle 60 Sekunden
-- Takt vom Start des vorherigen Cycles, nicht von dessen Ende
+- autoritativer nächster Cycle-Zeitpunkt, standardmäßig 60 Sekunden nach Cycle-Abschluss
 - kontrollierte Provider-Parallelität, standardmäßig höchstens zwei Requests
 - echter `WillhabenMarketplaceProvider` für öffentliche Marktplatz-Suchergebnisse
 - Baseline beim ersten erfolgreichen Lauf ohne Benachrichtigungen
@@ -32,6 +32,8 @@ vor; der Benutzer kopiert und versendet ihn selbst.
 - Test-Push, Recent-Listings-API sowie erweiterter Health-/Status-Endpunkt
 - vollständig offline laufende Tests mit Fake-Providern und HTTP-Mocks
 - Firefox-WebExtension mit Status-Popup und größerem, responsivem Dashboard
+- driftfreier Popup-Countdown aus monotonem lokalem Cycle-Anker mit gezieltem Cycle-Refresh
+- drei eigene, auswählbare Desktop-Sounds bei neuen Listings, höchstens einmal pro Cycle
 - UI für Marketplace-Suchen, Recent Listings und persistente Nachrichten-Templates
 - serverseitige Vorschau mit sicherer Zwischenablage-Funktion, aber ohne automatisches
   Einfügen oder Senden
@@ -40,16 +42,28 @@ vor; der Benutzer kopiert und versendet ihn selbst.
 
 Die Extension liegt in `extension/` und ist bewusst leichtgewichtig mit TypeScript, der
 WebExtensions API und DOM-Modulen umgesetzt. Sie enthält keine eigene Datenbank und keinen
-Scraping-Code. Alle Daten und die gesamte Template-/`article_label`-Logik kommen über die
-lokale API `http://127.0.0.1:8000` aus dem Python-Agenten.
+Scraping-Code. Popup und Dashboard senden ausschließlich typisierte Runtime-Nachrichten an
+den Firefox-MV3-Background-Broker. Dieser spricht über einen langlebigen Firefox-Native-Port
+mit dem fest registrierten Host `at.willhaben_suchagent.bridge`. Request-IDs ordnen auch
+parallele Antworten eindeutig zu; nach einem Disconnect verbindet erst die nächste echte
+Anfrage neu. Erst die kleine Python-Bridge ruft
+die Agent-API auf `127.0.0.1:8000` auf. Der geschlossene Operationskatalog akzeptiert weder
+beliebige URLs noch Shell-Befehle. Alle Daten und die gesamte Template-/Artikelphrasen-Logik
+kommen aus dem Python-Agenten.
 
 Das Popup zeigt Erreichbarkeit, Scheduler-Status, aktive Suchen, letzte/nächste Prüfung und
-den letzten Fund. Das Dashboard bietet Übersicht, Search-CRUD, Aktivieren/Deaktivieren,
+den letzten Fund. `next_cycle_due_at` synchronisiert nur die initiale Phase. Danach berechnet
+das Popup die sichtbaren Sekunden alle 100 ms aus einem lokalen `performance.now()`-Anker
+und ändert die Anzeige nur an vollen Sekundengrenzen. Bei `0` fragt es bis zur bestätigten
+Cycle-Fertigstellung gezielt den Agent-Status ab und setzt erst dann einen neuen lokalen
+60-Sekunden-Anker. Dadurch entstehen keine zusätzlichen Willhaben-Abfragen. Beim Schließen
+wird der lokale Timer beendet. Das
+Dashboard bietet Übersicht, Search-CRUD, Aktivieren/Deaktivieren,
 Recent-Listing-Karten, Template-CRUD inklusive Duplizieren, Standard-Template-Zuordnung und
 eine echte, im Backend gerenderte Nachrichtenvorschau mit „Text kopieren“ und „Inserat
 öffnen“. Es gibt kein Content Script und keinen Zugriff auf Cookies, Passwörter, Browser-
-Historie oder Willhaben-Accounts. Die einzigen Berechtigungen sind `clipboardWrite` sowie
-der lokale Host `127.0.0.1:8000` beziehungsweise dessen `localhost`-Alias.
+Historie oder Willhaben-Accounts. Die einzigen Berechtigungen sind `clipboardWrite` und
+`nativeMessaging`; HTTP-Hostberechtigungen besitzt die Extension nicht.
 
 ### Extension installieren und bauen
 
@@ -63,6 +77,38 @@ npm run build
 
 Der reproduzierbare Produktions-Build liegt danach in `extension/dist/`. Eine signierte
 `.xpi` und eine öffentliche Mozilla-Veröffentlichung gehören nicht zu M4.
+
+Für Fedora/Linux wird die lokale Bridge einmalig als Benutzer installiert. Das Skript nutzt
+bevorzugt den absoluten Interpreter aus `.venv`, erzeugt einen ausführbaren Launcher unter
+`~/.local/share/willhaben-suchagent/native-messaging/` und installiert das Firefox-Manifest
+unter `~/.mozilla/native-messaging-hosts/`. Eine aktivierte virtuelle Umgebung und `sudo`
+sind beim Firefox-Start nicht nötig:
+
+```bash
+./deployment/native-messaging/install-firefox-linux.sh
+```
+
+Die Installation kann sicher mit demselben Befehl aktualisiert und mit
+`./deployment/native-messaging/uninstall-firefox-linux.sh` entfernt werden. Weil der
+Entwicklungs-Launcher auf diesen Checkout verweist, muss nach dem Verschieben des Projekts
+das Installationsskript erneut ausgeführt werden.
+
+### Desktop-Sound
+
+`WILLHABEN_DESKTOP_SOUND_ENABLED=true` und `WILLHABEN_DESKTOP_SOUND_ID=notify` legen nur
+die erstmaligen SQLite-Standardwerte fest. Danach lassen sich Sound EIN/AUS sowie `Notify`,
+`Ping` oder `Pop` direkt im Dashboard persistent ändern und ohne Agent-Neustart testen.
+Alle drei kurzen WAV-Sounds werden deterministisch im Projekt synthetisiert. Sie gehören zum
+Python-Agenten und funktionieren deshalb auch bei geschlossenem Popup, geschlossenem Dashboard oder minimiertem
+Firefox. Ausgelöst wird er ausschließlich bei mindestens einem tatsächlich neuen,
+benachrichtigungsfähigen Listing und höchstens einmal pro Cycle. Baselines, bekannte
+Inserate, Neustarts und Notification-Retries bleiben stumm.
+
+Unter Fedora/Linux versucht der Agent nacheinander `pw-play`, `paplay` und `aplay`. Fehlt ein
+Player oder schlägt die Ausgabe fehl, wird dies nur protokolliert; Scheduler, SQLite und ntfy
+laufen weiter. „Ton testen“ spielt die gerade gewählte Variante als bewusste Vorschau ohne
+Willhaben-Abfrage oder Listingänderung. Windows und macOS können später hinter
+derselben `DesktopNotificationSoundService`-Abstraktion ergänzt werden.
 
 ### Template-System und Platzhalter
 
@@ -79,14 +125,17 @@ Ich hätte Interesse.
 Lg
 ```
 
-Unterstützt werden exakt `[Name]`, `[Artikel]`, `[Preis]`, `[Ort]`, `[Zustand]` und `[URL]`.
+Unterstützt werden exakt `[Name]`, `[Artikel]`, `[Artikelname]`, `[Preis]`, `[Ort]`,
+`[Zustand]` und `[URL]`. `[Artikel]` verwendet die natürliche `article_phrase`,
+`[Artikelname]` das artikellose `article_label`.
 Unbekannte Platzhalter weist die API verständlich zurück. `[Preis]` wird ohne unnötige
 Nachkommastellen mit `€` formatiert; `[URL]` ist die echte Detail-URL. Fehlende Werte werden
 als leere Werte eingesetzt. Eine dadurch allein übrig bleibende beschriftete Zeile wie
 `Ort: [Ort]` wird entfernt, Leerzeilen werden normalisiert und Satzzeichen werden bereinigt.
 So wird `Hallo [Name],` ohne Namen zu `Hallo,`. Niemals erscheinen `None`, `null`,
-`undefined` oder unterstützte rohe Platzhalter. Für ein nicht zuverlässig ermittelbares
-`[Artikel]` gilt immer der neutrale Fallback `der Artikel`.
+`undefined` oder unterstützte rohe Platzhalter. Ist das Genus unsicher, verwendet
+`[Artikel]` den zuverlässigen `article_label` ohne grammatischen Artikel. Nur wenn auch kein
+brauchbarer Name vorhanden ist, gilt der neutrale Fallback `der Artikel`.
 
 Jede Suche besitzt optional `default_template_id`. Beim Löschen eines verwendeten Templates
 setzt SQLite diese Zuordnung per `ON DELETE SET NULL` sauber zurück. Rendering erfolgt über
@@ -94,32 +143,39 @@ setzt SQLite diese Zuordnung per `ON DELETE SET NULL` sauber zurück. Rendering 
 Extension. Templates werden derzeit bewusst nicht an ntfy angehängt, damit der mobile Push
 mit Artikel, Preis, Verkäufer, Ort, Zustand und Direktlink kompakt bleibt.
 
-### `article_label`-Strategie
+### `article_label`- und `article_phrase`-Strategie
 
-`article_label` ist ein providerunabhängiges, persistiertes Listing-Feld. Die Ableitung ist
-deterministisch und verwendet keine generative KI und keinen externen Dienst:
+`article_label` ist die artikellose Produktbezeichnung, `article_phrase` die deutsche
+Nominalphrase für natürliche Nachrichten. Beide sind providerunabhängig und persistent.
+Die Ableitung ist deterministisch und verwendet keine generative KI und keinen externen Dienst.
+Für die Phrase gilt diese Priorität:
 
-1. öffentliche strukturierte Produkt-, Marken- und Modellattribute;
-2. relevante öffentliche Kategorieattribute (rekursiv in den normalisierten Attributen);
-3. einen konservativ am ersten klaren Titeltrenner (` - `, ` | `, Gedankenstrich)
-   gekürzten Titel; beim eindeutig erkannten iPhone-Muster endet die Bezeichnung nach der
-   Speicherkapazität;
-4. `der Artikel`, wenn nichts Verlässliches übrig bleibt.
+1. expliziter Produkttyp in öffentlichen strukturierten Attributen;
+2. eindeutiger Produkttyp im konservativ bereinigten Titel;
+3. Kategorie-/Unterkategorieinformationen;
+4. die zentral gepflegte, konservative Typ-/Produktfamilienzuordnung;
+5. der bereinigte `article_label` ohne grammatischen Artikel, wenn das Genus unsicher ist;
+6. `der Artikel`, wenn auch kein zuverlässiger Produktname vorhanden ist.
 
 Vorhandene M3.1-Listings werden bei der additiven Migration aus ihren gespeicherten
 Attributen beziehungsweise Titeln befüllt. Es werden keine Marken oder Modelle erfunden.
 
 ### Manueller Firefox-Test für M4
 
-1. Virtuelle Python-Umgebung aktivieren und den Agenten mit `willhaben-suchagent` starten.
-2. In einem zweiten Terminal `cd extension && npm install && npm run build` ausführen.
-3. Firefox öffnen, `about:debugging#/runtime/this-firefox` aufrufen, „Temporäres Add-on
-   laden …“ wählen und `extension/dist/manifest.json` auswählen.
-4. Das Extension-Symbol anklicken und das Popup öffnen.
-5. „Überwachung aktiv“, die letzte Prüfung und den erreichbaren Agenten prüfen.
-6. „Dashboard öffnen“ wählen und unter „Meine Suchen“ die bestehende ThinkPad-Suche prüfen.
-7. „Templates“ öffnen.
-8. Das automatisch angelegte Template „Standard“ und dessen Inhalt prüfen.
+1. Im Projektroot `./deployment/native-messaging/install-firefox-linux.sh` ausführen.
+2. Den Agenten mit `./.venv/bin/willhaben-suchagent` starten; eine vorherige Aktivierung der
+   virtuellen Umgebung ist nicht erforderlich.
+3. In einem zweiten Terminal `cd extension && npm install && npm run build` ausführen.
+4. Firefox öffnen, `about:debugging#/runtime/this-firefox` aufrufen, eine vorhandene
+   temporäre Version mit „Entfernen“ vollständig löschen, dann „Temporäres Add-on laden …“
+   wählen und `extension/dist/manifest.json` auswählen.
+5. Bei der neu geladenen Extension „Untersuchen“ wählen und die Background-Konsole offen
+   lassen. Das Extension-Symbol anklicken und das Popup öffnen. Die Konsole muss
+   `api_broker_request operation=status` und danach
+   `api_broker_success operation=status` zeigen.
+6. „Überwachung aktiv“, die letzte Prüfung und den erreichbaren Agenten prüfen.
+7. „Dashboard öffnen“ wählen und unter „Meine Suchen“ die bestehende ThinkPad-Suche prüfen.
+8. „Templates“ öffnen und das automatisch angelegte Template „Standard“ prüfen.
 9. „Neue Inserate“ öffnen und bei einem vorhandenen Listing „Inserat öffnen“ testen.
 10. „Nachricht vorbereiten“ wählen; das Standard-Template muss mit echten Listing-Daten
     serverseitig gerendert werden.
@@ -130,11 +186,17 @@ Attributen beziehungsweise Titeln befüllt. Es werden keine Marken oder Modelle 
     müssen erhalten bleiben.
 14. „+ Neue Suche“ wählen, Name, Suchbegriff, Preise, bestätigte Region/Kategorie, Live-
     Status und optionales Standard-Template setzen und die Suche erstellen.
+15. Das Popup für einen vollständigen Cycle geöffnet lassen: `60`, `59`, `58` bis `0`
+    beobachten; nach bestätigtem Abschluss müssen „Letzte Prüfung: gerade eben“ und erneut
+    `60` erscheinen.
+16. Im Dashboard unter „Einstellungen“ alle drei Töne mit „Ton testen“ anhören, einen Ton
+    auswählen und Sound AUS/EIN testen. Die Änderungen bleiben in SQLite erhalten und lösen
+    keinen Willhaben-Request aus.
 
 Die Extension versucht eine unterbrochene lokale Verbindung alle 30 Sekunden erneut. Bei
 Offline-Zustand bleibt das Dashboard bedienbar und zeigt nur eine verständliche Meldung ohne
-Stacktrace. Firefox vergibt temporär eine dynamische `moz-extension://`-Origin; mit der eng
-begrenzten WebExtension-Hostberechtigung sind keine globalen CORS-Freigaben im Backend nötig.
+Stacktrace. Ein fehlender Native Host wird getrennt von einem laufenden Host mit nicht
+erreichbarem Agenten angezeigt. Das Backend benötigt für die Extension keine CORS-Freigabe.
 
 ## Voraussetzungen und Installation
 
@@ -159,6 +221,8 @@ cp .env.example .env
 | API-Port | `8000` | `WILLHABEN_API_PORT` |
 | Umgebung | `development` | `WILLHABEN_APP_ENVIRONMENT` |
 | Scheduler aktiv | `true` | `WILLHABEN_SCHEDULER_ENABLED` |
+| Desktop-Sound bei neuen Inseraten | `true` | `WILLHABEN_DESKTOP_SOUND_ENABLED` |
+| initialer Desktop-Sound | `notify` | `WILLHABEN_DESKTOP_SOUND_ID` |
 | ntfy aktiv | `false` | `NTFY_ENABLED` |
 | ntfy-Basis-URL | `https://ntfy.sh` | `NTFY_BASE_URL` |
 | ntfy-Topic | nicht gesetzt | `NTFY_TOPIC` |
@@ -175,6 +239,9 @@ weist ntfy aber nachvollziehbar als deaktiviert aus. Tokens werden nur aus Konfi
 beziehungsweise Environment gelesen und weder im Status noch in Logs ausgegeben. Für das
 öffentliche `ntfy.sh` empfiehlt sich ein langer, schwer zu erratender Topic-Name. Ein Token
 ist nur nötig, wenn der gewählte Server beziehungsweise das Topic Authentifizierung verlangt.
+Neue Listing-Pushs verwenden die ntfy-Priorität `high`. Es wird kein nicht portabler Custom-
+iOS-Sound behauptet oder angefordert; Android kann den ntfy-Prioritätskanal weiterhin lokal
+mit einem eigenen Ton konfigurieren.
 
 ## Datenfluss und Zustellmodell
 
@@ -346,7 +413,7 @@ Entwicklungs-Sandbox gedacht.
    ```
 
 6. Die Suche aktiviert lassen. Der Scheduler startet Folge-Cycles jeweils 60 Sekunden nach
-   dem vorherigen Cycle-Start. Ein danach erstmals sichtbares Inserat erzeugt genau einen
+   dem vorherigen Cycle-Abschluss. Ein danach erstmals sichtbares Inserat erzeugt genau einen
    Detailrequest und danach einen ntfy-Push. Im Log erscheinen
    `listing_enrichment_started` und anschließend `listing_enrichment_completed`,
    `listing_enrichment_partial` oder `listing_enrichment_failed`. Antippen öffnet die echte
@@ -426,13 +493,17 @@ pytest
 ## Architektur und bekannte Grenzen
 
 - `agent/app/api`: lokale Search-, Listing-, Template-, Notification- und Status-API
-- `agent/app/core`: Konfiguration, Domain-/Enrichment-Modelle, `article_label`, serverseitiges
+- `agent/app/core`: Konfiguration, Domain-/Enrichment-Modelle, Artikelphrase, serverseitiges
   Template-Rendering, Scheduler und Health-State
 - `agent/app/storage`: SQLite-Schema, Migration und transaktionale Deduplizierung
 - `agent/app/notifications`: providerunabhängiger Vertrag und ntfy-Transport
 - `agent/app/willhaben`: Search Builder, gemeinsamer HTTP-Transport, getrennte Such- und
   Detailparser, Detailclient, Listing-Enricher und echter Provider
-- `extension/src`: API-Client, Online-/Offline-State, Popup, Dashboard und DOM-Komponenten
+- `agent/app/native_messaging`: geschlossene stdio-Bridge mit Firefox-Framing und festem
+  Mapping auf die lokale Agent-API
+- `deployment/native-messaging`: Fedora/Linux-Benutzerinstallation und Deinstallation
+- `extension/src`: Background-API-Broker, Runtime-Client, Online-/Offline-State, Popup,
+  Dashboard und DOM-Komponenten
 - `extension/public/manifest.json`: eng begrenztes Firefox-MV3-Manifest
 
 Der Scheduler kennt keine Willhaben-spezifischen HTML-/JSON-Strukturen. Öffentliche
@@ -450,5 +521,7 @@ anlegbar; freie Bezirks-/Umkreissuchen und unbestätigte Kategorien werden nicht
 Die öffentliche Willhaben-Seitenstruktur kann sich ändern. Es gibt noch keine Geräte-/
 Benutzerverwaltung, keine Mozilla-Signierung und keine öffentliche Distribution. Die
 Extension speichert keine Daten selbst. Automatisches Einfügen, Klicken oder Senden ist nicht
-implementiert und wird architektonisch nicht vorbereitet. Auto & Motor (M5) wurde nicht
-begonnen.
+implementiert und wird architektonisch nicht vorbereitet. Für Native Messaging existiert in
+M4 nur die Fedora/Linux-Benutzerinstallation; Windows, macOS und Firefox Flatpak sind noch
+nicht eingerichtet. Der Entwicklungs-Launcher setzt einen unveränderten Projektpfad voraus.
+Auto & Motor (M5) wurde nicht begonnen.

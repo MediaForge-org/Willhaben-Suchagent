@@ -12,7 +12,7 @@ from typing import Any
 
 import aiosqlite
 
-from agent.app.core.article_label import derive_article_label
+from agent.app.core.article_label import derive_article_label, derive_article_phrase
 from agent.app.core.models import (
     EnrichmentStatus,
     Listing,
@@ -23,6 +23,7 @@ from agent.app.core.models import (
 )
 from agent.app.core.templates import DEFAULT_TEMPLATE_BODY, DEFAULT_TEMPLATE_NAME
 from agent.app.core.time import to_db_timestamp
+from agent.app.notifications.sound import DEFAULT_SOUND_ID, SOUND_VARIANTS
 from agent.app.storage.schema import SCHEMA
 
 
@@ -43,6 +44,12 @@ class SearchCreateData:
 class TemplateCreateData:
     name: str
     body: str
+
+
+@dataclass(frozen=True, slots=True)
+class DesktopSoundPreferences:
+    enabled: bool
+    sound_id: str
 
 
 @dataclass(slots=True)
@@ -66,6 +73,7 @@ class RecentListing:
     provider_listing_id: str
     title: str
     article_label: str
+    article_phrase: str
     price: Decimal | None
     location: str | None
     image_url: str | None
@@ -86,7 +94,14 @@ class Database:
         self.path = Path(path)
         self._write_lock = asyncio.Lock()
 
-    async def initialize(self) -> None:
+    async def initialize(
+        self,
+        *,
+        desktop_sound_enabled: bool = True,
+        desktop_sound_id: str = DEFAULT_SOUND_ID,
+    ) -> None:
+        if desktop_sound_id not in SOUND_VARIANTS:
+            raise ValueError(f"Unsupported desktop sound id: {desktop_sound_id}")
         self.path.parent.mkdir(parents=True, exist_ok=True)
         async with self._connect() as connection:
             await connection.execute("PRAGMA journal_mode = WAL")
@@ -96,7 +111,72 @@ class Database:
             await self._migrate_listings(connection)
             await self._migrate_notifications(connection)
             await self._ensure_default_template(connection)
+            await self._ensure_agent_settings(
+                connection,
+                desktop_sound_enabled=desktop_sound_enabled,
+                desktop_sound_id=desktop_sound_id,
+            )
             await connection.commit()
+
+    @staticmethod
+    async def _ensure_agent_settings(
+        connection: aiosqlite.Connection,
+        *,
+        desktop_sound_enabled: bool,
+        desktop_sound_id: str,
+    ) -> None:
+        await connection.executemany(
+            "INSERT OR IGNORE INTO agent_settings(key, value) VALUES (?, ?)",
+            (
+                ("desktop_sound_enabled", "1" if desktop_sound_enabled else "0"),
+                ("desktop_sound_id", desktop_sound_id),
+            ),
+        )
+        await connection.execute(
+            "UPDATE agent_settings SET value = ? "
+            "WHERE key = 'desktop_sound_id' AND value IN "
+            "('signal', 'beacon', 'pulse', 'chime', 'glass', 'rise', 'soft')",
+            (DEFAULT_SOUND_ID,),
+        )
+
+    async def get_desktop_sound_preferences(self) -> DesktopSoundPreferences:
+        async with self._connect() as connection:
+            cursor = await connection.execute(
+                "SELECT key, value FROM agent_settings "
+                "WHERE key IN ('desktop_sound_enabled', 'desktop_sound_id')"
+            )
+            values = {row["key"]: row["value"] for row in await cursor.fetchall()}
+        sound_id = values.get("desktop_sound_id", DEFAULT_SOUND_ID)
+        if sound_id not in SOUND_VARIANTS:
+            sound_id = DEFAULT_SOUND_ID
+        return DesktopSoundPreferences(
+            enabled=values.get("desktop_sound_enabled", "1") == "1",
+            sound_id=sound_id,
+        )
+
+    async def update_desktop_sound_preferences(
+        self,
+        *,
+        enabled: bool | None = None,
+        sound_id: str | None = None,
+    ) -> DesktopSoundPreferences:
+        if enabled is None and sound_id is None:
+            raise ValueError("At least one desktop sound setting is required")
+        if sound_id is not None and sound_id not in SOUND_VARIANTS:
+            raise ValueError(f"Unsupported desktop sound id: {sound_id}")
+        changes: list[tuple[str, str]] = []
+        if enabled is not None:
+            changes.append(("desktop_sound_enabled", "1" if enabled else "0"))
+        if sound_id is not None:
+            changes.append(("desktop_sound_id", sound_id))
+        async with self._write_lock, self._connect() as connection:
+            await connection.executemany(
+                "INSERT INTO agent_settings(key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                changes,
+            )
+            await connection.commit()
+        return await self.get_desktop_sound_preferences()
 
     @staticmethod
     async def _migrate_searches(connection: aiosqlite.Connection) -> None:
@@ -115,7 +195,8 @@ class Database:
         cursor = await connection.execute("PRAGMA table_info(listings)")
         columns = {row[1] for row in await cursor.fetchall()}
         additions = {
-            "article_label": "TEXT NOT NULL DEFAULT 'der Artikel'",
+            "article_label": "TEXT NOT NULL DEFAULT 'Artikel'",
+            "article_phrase": "TEXT NOT NULL DEFAULT 'der Artikel'",
             "seller_name": "TEXT",
             "seller_type": "TEXT",
             "condition": "TEXT",
@@ -127,18 +208,20 @@ class Database:
                     f"ALTER TABLE listings ADD COLUMN {name} {definition}"  # noqa: S608
                 )
         cursor = await connection.execute(
-            "SELECT id, title, attributes_json, article_label FROM listings"
+            "SELECT id, title, attributes_json, article_label, article_phrase FROM listings"
         )
         for row in await cursor.fetchall():
-            if row["article_label"] != "der Artikel":
-                continue
             try:
                 attributes = json.loads(row["attributes_json"] or "{}")
             except json.JSONDecodeError:
                 attributes = {}
+            article_label = derive_article_label(row["title"], attributes)
+            article_phrase = derive_article_phrase(article_label, row["title"], attributes)
+            if row["article_label"] == article_label and row["article_phrase"] == article_phrase:
+                continue
             await connection.execute(
-                "UPDATE listings SET article_label = ? WHERE id = ?",
-                (derive_article_label(row["title"], attributes), row["id"]),
+                "UPDATE listings SET article_label = ?, article_phrase = ? WHERE id = ?",
+                (article_label, article_phrase, row["id"]),
             )
 
     @staticmethod
@@ -389,10 +472,11 @@ class Database:
                         await connection.execute(
                             """
                             INSERT INTO listings (
-                                provider_listing_id, title, article_label, price, url, image_url,
+                                provider_listing_id, title, article_label, article_phrase,
+                                price, url, image_url,
                                 category, location, seller_name, seller_type, condition,
                                 enrichment_status, attributes_json, first_seen_at, last_seen_at
-                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                             ON CONFLICT(provider_listing_id) DO UPDATE SET
                                 title = CASE
                                     WHEN listings.enrichment_status IN ('enriched', 'partial')
@@ -400,6 +484,9 @@ class Database:
                                 article_label = CASE
                                     WHEN listings.enrichment_status IN ('enriched', 'partial')
                                     THEN listings.article_label ELSE excluded.article_label END,
+                                article_phrase = CASE
+                                    WHEN listings.enrichment_status IN ('enriched', 'partial')
+                                    THEN listings.article_phrase ELSE excluded.article_phrase END,
                                 price = CASE
                                     WHEN listings.enrichment_status IN ('enriched', 'partial')
                                     THEN listings.price ELSE excluded.price END,
@@ -420,6 +507,7 @@ class Database:
                                 listing.provider_listing_id,
                                 listing.title,
                                 listing.article_label,
+                                listing.article_phrase,
                                 str(listing.price) if listing.price is not None else None,
                                 str(listing.url),
                                 str(listing.image_url) if listing.image_url else None,
@@ -509,7 +597,7 @@ class Database:
                 UPDATE listings
                 SET title = ?, price = ?, image_url = ?, location = ?, seller_name = ?,
                     seller_type = ?, condition = ?, enrichment_status = ?, attributes_json = ?,
-                    article_label = ?
+                    article_label = ?, article_phrase = ?
                 WHERE provider_listing_id = ? AND enrichment_status = 'not_requested'
                 """,
                 (
@@ -523,6 +611,7 @@ class Database:
                     listing.enrichment_status.value,
                     json.dumps(listing.attributes, separators=(",", ":"), sort_keys=True),
                     listing.article_label,
+                    listing.article_phrase,
                     listing.provider_listing_id,
                 ),
             )
@@ -547,6 +636,7 @@ class Database:
                     listings.provider_listing_id,
                     listings.title,
                     listings.article_label,
+                    listings.article_phrase,
                     listings.price,
                     listings.url,
                     listings.image_url,
@@ -573,6 +663,7 @@ class Database:
                     provider_listing_id=row["provider_listing_id"],
                     title=row["title"],
                     article_label=row["article_label"],
+                    article_phrase=row["article_phrase"],
                     price=Decimal(row["price"]) if row["price"] is not None else None,
                     url=row["url"],
                     image_url=row["image_url"],
@@ -698,6 +789,7 @@ class Database:
                         provider_listing_id=row["provider_listing_id"],
                         title=row["title"],
                         article_label=row["article_label"],
+                        article_phrase=row["article_phrase"],
                         price=Decimal(row["price"]) if row["price"] is not None else None,
                         location=row["location"],
                         image_url=row["image_url"],
@@ -725,6 +817,7 @@ class Database:
             provider_listing_id=row["provider_listing_id"],
             title=row["title"],
             article_label=row["article_label"],
+            article_phrase=row["article_phrase"],
             price=Decimal(row["price"]) if row["price"] is not None else None,
             url=row["url"],
             image_url=row["image_url"],

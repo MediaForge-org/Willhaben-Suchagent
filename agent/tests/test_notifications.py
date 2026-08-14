@@ -92,6 +92,7 @@ async def test_ntfy_omits_all_missing_optional_fields_and_null_representations(
     assert "none" not in message.casefold()
     assert "null" not in message.casefold()
     assert requests[0].headers["click"] == str(listing.url)
+    assert requests[0].headers["priority"] == "high"
 
 
 @pytest.mark.asyncio
@@ -138,6 +139,7 @@ async def test_ntfy_test_message_uses_no_listing() -> None:
 
     assert requests[0].headers["title"] == "Willhaben-Suchagent"
     assert "click" not in requests[0].headers
+    assert "priority" not in requests[0].headers
     assert requests[0].content.decode() == "Willhaben-Suchagent – Test erfolgreich"
 
 

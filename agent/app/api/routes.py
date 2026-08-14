@@ -1,6 +1,11 @@
 from fastapi import APIRouter, HTTPException, Query, Request, Response, status
 
 from agent.app.api.schemas import (
+    AgentSettingsPatch,
+    AgentSettingsResponse,
+    DesktopSoundOption,
+    DesktopSoundTestRequest,
+    DesktopSoundTestResponse,
     HealthResponse,
     MarketplaceOption,
     MarketplaceOptionsResponse,
@@ -23,6 +28,7 @@ from agent.app.notifications.service import (
     NotificationDisabledError,
     NotificationService,
 )
+from agent.app.notifications.sound import SOUND_VARIANTS, DesktopNotificationSoundService
 from agent.app.storage.database import Database, SearchCreateData, TemplateCreateData
 from agent.app.willhaben.marketplace_search import (
     SUPPORTED_MARKETPLACE_CATEGORIES,
@@ -40,6 +46,10 @@ def get_notification_service(request: Request) -> NotificationService:
     return request.app.state.notification_service
 
 
+def get_desktop_sound_service(request: Request) -> DesktopNotificationSoundService:
+    return request.app.state.desktop_sound_service
+
+
 @router.get("/health", response_model=HealthResponse, tags=["health"])
 async def health(request: Request) -> HealthResponse:
     database = get_database(request)
@@ -49,6 +59,7 @@ async def health(request: Request) -> HealthResponse:
         status=state.status,
         process_started_at=state.process_started_at,
         last_cycle_started_at=state.last_cycle_started_at,
+        next_cycle_due_at=state.next_cycle_due_at,
         last_cycle_completed_at=state.last_cycle_completed_at,
         last_successful_cycle_at=state.last_successful_cycle_at,
         last_successful_willhaben_cycle_at=state.last_successful_willhaben_cycle_at,
@@ -65,6 +76,7 @@ async def application_status(request: Request) -> StatusResponse:
     settings = request.app.state.settings
     database = get_database(request)
     notifications = get_notification_service(request)
+    desktop_sound = get_desktop_sound_service(request)
     persisted_last_notification = await database.last_successful_notification_at()
     last_notification = state.last_successful_notification_at
     if persisted_last_notification is not None and (
@@ -86,8 +98,55 @@ async def application_status(request: Request) -> StatusResponse:
         last_successful_notification_at=last_notification,
         ntfy_enabled=notifications.enabled,
         ntfy_disabled_reason=notifications.disabled_reason,
+        desktop_sound_enabled=desktop_sound.enabled,
+        desktop_sound_id=desktop_sound.sound_id,
+        desktop_sound_available=desktop_sound.available,
+        desktop_sound_disabled_reason=desktop_sound.disabled_reason,
         database_counts=await database.status_counts(),
     )
+
+
+def _settings_response(
+    *,
+    enabled: bool,
+    sound_id: str,
+) -> AgentSettingsResponse:
+    return AgentSettingsResponse(
+        desktop_sound_enabled=enabled,
+        desktop_sound_id=sound_id,
+        desktop_sounds=[
+            DesktopSoundOption(id=variant.id, name=variant.name)
+            for variant in SOUND_VARIANTS.values()
+        ],
+    )
+
+
+@router.get("/api/v1/settings", response_model=AgentSettingsResponse, tags=["settings"])
+async def agent_settings(request: Request) -> AgentSettingsResponse:
+    preferences = await get_database(request).get_desktop_sound_preferences()
+    return _settings_response(enabled=preferences.enabled, sound_id=preferences.sound_id)
+
+
+@router.patch("/api/v1/settings", response_model=AgentSettingsResponse, tags=["settings"])
+async def update_agent_settings(
+    payload: AgentSettingsPatch,
+    request: Request,
+) -> AgentSettingsResponse:
+    changes = payload.model_dump(exclude_unset=True)
+    if not changes or any(value is None for value in changes.values()):
+        raise HTTPException(status_code=422, detail="Mindestens eine Einstellung ist erforderlich")
+    try:
+        preferences = await get_database(request).update_desktop_sound_preferences(
+            enabled=changes.get("desktop_sound_enabled"),
+            sound_id=changes.get("desktop_sound_id"),
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    get_desktop_sound_service(request).configure(
+        enabled=preferences.enabled,
+        sound_id=preferences.sound_id,
+    )
+    return _settings_response(enabled=preferences.enabled, sound_id=preferences.sound_id)
 
 
 @router.get("/api/v1/searches", response_model=list[SearchResponse], tags=["searches"])
@@ -173,6 +232,7 @@ async def recent_listings(
             provider_listing_id=item.provider_listing_id,
             title=item.title,
             article_label=item.article_label,
+            article_phrase=item.article_phrase,
             price=item.price,
             location=item.location,
             image_url=item.image_url,
@@ -330,4 +390,43 @@ async def test_notification(request: Request) -> NotificationTestResponse:
     return NotificationTestResponse(
         status="sent",
         message="Willhaben-Suchagent – Test erfolgreich",
+    )
+
+
+@router.post(
+    "/api/v1/desktop-sound/test",
+    response_model=DesktopSoundTestResponse,
+    tags=["notifications"],
+)
+async def test_desktop_sound(
+    request: Request,
+    payload: DesktopSoundTestRequest | None = None,
+) -> DesktopSoundTestResponse:
+    sound = get_desktop_sound_service(request)
+    sound_id = payload.desktop_sound_id if payload and payload.desktop_sound_id else sound.sound_id
+    if sound_id not in SOUND_VARIANTS:
+        raise HTTPException(status_code=422, detail=f"Unsupported desktop sound id: {sound_id}")
+    try:
+        played = await sound.preview(sound_id)
+    except Exception as error:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Desktop-Sound konnte nicht abgespielt werden",
+        ) from error
+    if not played:
+        raise HTTPException(
+            status_code=(
+                status.HTTP_502_BAD_GATEWAY
+                if sound.available
+                else status.HTTP_503_SERVICE_UNAVAILABLE
+            ),
+            detail=(
+                "Desktop-Sound konnte nicht abgespielt werden"
+                if sound.available
+                else "Kein unterstützter Audio-Player gefunden"
+            ),
+        )
+    return DesktopSoundTestResponse(
+        status="played",
+        message=f"{SOUND_VARIANTS[sound_id].name} wurde abgespielt",
     )
