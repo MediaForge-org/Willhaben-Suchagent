@@ -17,6 +17,10 @@ class SearchPayloadBase(BaseModel):
     price_max: Decimal | None = Field(default=None, ge=0)
     category_filters: dict[str, Any] = Field(default_factory=dict)
     default_template_id: int | None = Field(default=None, ge=1)
+    notify_ntfy: bool = True
+    notify_discord: bool = True
+    notify_email: bool = True
+    notify_desktop_sound: bool = True
 
     @model_validator(mode="after")
     def validate_price_range(self):
@@ -42,6 +46,10 @@ class SearchPatch(BaseModel):
     price_max: Decimal | None = Field(default=None, ge=0)
     category_filters: dict[str, Any] | None = None
     default_template_id: int | None = Field(default=None, ge=1)
+    notify_ntfy: bool | None = None
+    notify_discord: bool | None = None
+    notify_email: bool | None = None
+    notify_desktop_sound: bool | None = None
 
 
 class SearchResponse(SearchPayloadBase):
@@ -81,6 +89,10 @@ class StatusResponse(HealthResponse):
     last_successful_notification_at: datetime | None
     ntfy_enabled: bool
     ntfy_disabled_reason: str | None
+    discord_enabled: bool
+    discord_disabled_reason: str | None
+    email_enabled: bool
+    email_disabled_reason: str | None
     desktop_sound_enabled: bool
     desktop_sound_id: str
     desktop_sound_available: bool

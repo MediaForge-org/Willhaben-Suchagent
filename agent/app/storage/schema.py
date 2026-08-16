@@ -22,7 +22,11 @@ CREATE TABLE IF NOT EXISTS searches (
     last_checked_at TEXT,
     last_success_at TEXT,
     consecutive_errors INTEGER NOT NULL DEFAULT 0 CHECK (consecutive_errors >= 0),
-    default_template_id INTEGER REFERENCES message_templates(id) ON DELETE SET NULL
+    default_template_id INTEGER REFERENCES message_templates(id) ON DELETE SET NULL,
+    notify_ntfy INTEGER NOT NULL DEFAULT 1 CHECK (notify_ntfy IN (0, 1)),
+    notify_discord INTEGER NOT NULL DEFAULT 1 CHECK (notify_discord IN (0, 1)),
+    notify_email INTEGER NOT NULL DEFAULT 1 CHECK (notify_email IN (0, 1)),
+    notify_desktop_sound INTEGER NOT NULL DEFAULT 1 CHECK (notify_desktop_sound IN (0, 1))
 );
 
 CREATE INDEX IF NOT EXISTS idx_searches_enabled ON searches(enabled);
@@ -68,6 +72,20 @@ CREATE TABLE IF NOT EXISTS notifications (
 );
 
 CREATE INDEX IF NOT EXISTS idx_notifications_status ON notifications(status);
+
+CREATE TABLE IF NOT EXISTS channel_deliveries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    listing_id INTEGER NOT NULL REFERENCES listings(id) ON DELETE CASCADE,
+    channel TEXT NOT NULL CHECK (channel IN ('ntfy', 'discord', 'email')),
+    status TEXT NOT NULL CHECK (status IN ('pending', 'sent', 'failed', 'skipped')),
+    attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    last_attempt_at TEXT,
+    sent_at TEXT,
+    last_error TEXT,
+    UNIQUE (listing_id, channel)
+);
 
 CREATE TABLE IF NOT EXISTS agent_settings (
     key TEXT PRIMARY KEY,

@@ -42,6 +42,10 @@ class SearchDefinition(BaseModel):
     price_max: Decimal | None = Field(default=None, ge=0)
     category_filters: dict[str, Any] = Field(default_factory=dict)
     default_template_id: int | None = Field(default=None, ge=1)
+    notify_ntfy: bool = True
+    notify_discord: bool = True
+    notify_email: bool = True
+    notify_desktop_sound: bool = True
     baseline_initialized: bool = False
     created_at: datetime
     updated_at: datetime

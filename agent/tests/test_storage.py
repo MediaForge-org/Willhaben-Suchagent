@@ -207,3 +207,86 @@ async def test_reactivation_preserves_baseline_but_filter_change_resets_it(
     changed = await database.update_search(search.id, {"query": "BMW Touring"})
     assert changed is not None
     assert changed.baseline_initialized is False
+
+
+@pytest.mark.asyncio
+async def test_initialize_migrates_legacy_searches_with_notification_channel_defaults(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "legacy-searches.db"
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE searches (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                category TEXT NOT NULL,
+                query_json TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                baseline_initialized INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                last_checked_at TEXT,
+                last_success_at TEXT,
+                consecutive_errors INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO searches(name, category, query_json, created_at, updated_at)
+            VALUES ('Legacy', 'marketplace', '{}', '2026-01-01T00:00:00+00:00',
+                    '2026-01-01T00:00:00+00:00')
+            """
+        )
+
+    await Database(path).initialize()
+
+    with sqlite3.connect(path) as connection:
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(searches)")}
+        migrated = connection.execute(
+            "SELECT notify_ntfy, notify_discord, notify_email, notify_desktop_sound FROM searches"
+        ).fetchone()
+    assert {
+        "notify_ntfy",
+        "notify_discord",
+        "notify_email",
+        "notify_desktop_sound",
+    } <= columns
+    assert migrated == (1, 1, 1, 1)
+
+
+@pytest.mark.asyncio
+async def test_channel_delivery_status_persists_and_is_not_overwritten_after_sent(
+    database: Database,
+    search_data: SearchCreateData,
+    listing_factory: Callable[..., Listing],
+) -> None:
+    search = await database.create_search(search_data)
+    await database.persist_cycle_results([(search, [])])
+    initialized = await database.get_search(search.id)
+    assert initialized is not None
+    listing = listing_factory("channel-status")
+    await database.persist_cycle_results([(initialized, [listing])])
+
+    state = await database.load_channel_dispatch_state("channel-status")
+    assert state is not None
+    assert state.enabled_channels == {"ntfy", "discord", "email"}
+    assert state.channel_statuses == {}
+
+    await database.record_channel_delivery_attempt(
+        state.listing_id, "ntfy", sent=False, error="boom"
+    )
+    failed_state = await database.load_channel_dispatch_state("channel-status")
+    assert failed_state is not None
+    assert failed_state.channel_statuses["ntfy"] == "failed"
+
+    await database.record_channel_delivery_attempt(state.listing_id, "ntfy", sent=True)
+    sent_state = await database.load_channel_dispatch_state("channel-status")
+    assert sent_state is not None
+    assert sent_state.channel_statuses["ntfy"] == "sent"
+
+    await database.record_channel_delivery_skipped(state.listing_id, "ntfy")
+    unchanged_state = await database.load_channel_dispatch_state("channel-status")
+    assert unchanged_state is not None
+    assert unchanged_state.channel_statuses["ntfy"] == "sent"

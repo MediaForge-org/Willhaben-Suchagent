@@ -77,6 +77,10 @@ async def application_status(request: Request) -> StatusResponse:
     database = get_database(request)
     notifications = get_notification_service(request)
     desktop_sound = get_desktop_sound_service(request)
+    channels = request.app.state.notification_channels
+    ntfy_channel = channels.get("ntfy")
+    discord_channel = channels.get("discord")
+    email_channel = channels.get("email")
     persisted_last_notification = await database.last_successful_notification_at()
     last_notification = state.last_successful_notification_at
     if persisted_last_notification is not None and (
@@ -96,8 +100,18 @@ async def application_status(request: Request) -> StatusResponse:
         pending_notifications=await database.count_notifications_with_status("pending"),
         failed_notifications=await database.count_notifications_with_status("failed"),
         last_successful_notification_at=last_notification,
-        ntfy_enabled=notifications.enabled,
-        ntfy_disabled_reason=notifications.disabled_reason,
+        ntfy_enabled=ntfy_channel.enabled if ntfy_channel else notifications.enabled,
+        ntfy_disabled_reason=(
+            ntfy_channel.disabled_reason if ntfy_channel else notifications.disabled_reason
+        ),
+        discord_enabled=discord_channel.enabled if discord_channel else False,
+        discord_disabled_reason=(
+            discord_channel.disabled_reason if discord_channel else "Discord is not configured"
+        ),
+        email_enabled=email_channel.enabled if email_channel else False,
+        email_disabled_reason=(
+            email_channel.disabled_reason if email_channel else "E-Mail is not configured"
+        ),
         desktop_sound_enabled=desktop_sound.enabled,
         desktop_sound_id=desktop_sound.sound_id,
         desktop_sound_available=desktop_sound.available,
@@ -185,7 +199,17 @@ async def update_search(
     request: Request,
 ) -> SearchResponse:
     changes = payload.model_dump(exclude_unset=True)
-    required_fields = {"name", "category", "enabled", "query", "category_filters"}
+    required_fields = {
+        "name",
+        "category",
+        "enabled",
+        "query",
+        "category_filters",
+        "notify_ntfy",
+        "notify_discord",
+        "notify_email",
+        "notify_desktop_sound",
+    }
     if any(value is None for key, value in changes.items() if key in required_fields):
         raise HTTPException(status_code=422, detail="Field may not be null")
     database = get_database(request)

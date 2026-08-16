@@ -38,6 +38,10 @@ class SearchCreateData:
     price_max: Decimal | None
     category_filters: dict[str, Any]
     default_template_id: int | None = None
+    notify_ntfy: bool = True
+    notify_discord: bool = True
+    notify_email: bool = True
+    notify_desktop_sound: bool = True
 
 
 @dataclass(slots=True)
@@ -57,6 +61,7 @@ class CyclePersistenceResult:
     created_notification_count: int
     new_listing_count: int
     baseline_initializations: int
+    desktop_sound_requested: bool = False
 
 
 @dataclass(slots=True)
@@ -65,6 +70,16 @@ class PendingNotification:
     listing: Listing
     status: str
     attempt_count: int
+
+
+PUSH_CHANNELS: tuple[str, ...] = ("ntfy", "discord", "email")
+
+
+@dataclass(slots=True)
+class ChannelDispatchState:
+    listing_id: int
+    enabled_channels: set[str]
+    channel_statuses: dict[str, str]
 
 
 @dataclass(slots=True)
@@ -187,6 +202,17 @@ class Database:
                 "ALTER TABLE searches ADD COLUMN default_template_id INTEGER "
                 "REFERENCES message_templates(id) ON DELETE SET NULL"
             )
+        channel_additions = {
+            "notify_ntfy": "INTEGER NOT NULL DEFAULT 1",
+            "notify_discord": "INTEGER NOT NULL DEFAULT 1",
+            "notify_email": "INTEGER NOT NULL DEFAULT 1",
+            "notify_desktop_sound": "INTEGER NOT NULL DEFAULT 1",
+        }
+        for name, definition in channel_additions.items():
+            if name not in columns:
+                await connection.execute(
+                    f"ALTER TABLE searches ADD COLUMN {name} {definition}"  # noqa: S608
+                )
 
     @staticmethod
     async def _migrate_listings(connection: aiosqlite.Connection) -> None:
@@ -293,6 +319,10 @@ class Database:
             last_success_at=row["last_success_at"],
             consecutive_errors=row["consecutive_errors"],
             default_template_id=row["default_template_id"],
+            notify_ntfy=bool(row["notify_ntfy"]),
+            notify_discord=bool(row["notify_discord"]),
+            notify_email=bool(row["notify_email"]),
+            notify_desktop_sound=bool(row["notify_desktop_sound"]),
             **query_data,
         )
 
@@ -303,8 +333,9 @@ class Database:
                 """
                 INSERT INTO searches (
                     name, category, query_json, enabled, baseline_initialized,
-                    created_at, updated_at, default_template_id
-                ) VALUES (?, ?, ?, ?, 0, ?, ?, ?)
+                    created_at, updated_at, default_template_id,
+                    notify_ntfy, notify_discord, notify_email, notify_desktop_sound
+                ) VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     data.name,
@@ -314,6 +345,10 @@ class Database:
                     timestamp,
                     timestamp,
                     data.default_template_id,
+                    int(data.notify_ntfy),
+                    int(data.notify_discord),
+                    int(data.notify_email),
+                    int(data.notify_desktop_sound),
                 ),
             )
             await connection.commit()
@@ -360,6 +395,10 @@ class Database:
             "price_max",
             "category_filters",
             "default_template_id",
+            "notify_ntfy",
+            "notify_discord",
+            "notify_email",
+            "notify_desktop_sound",
         }
         merged = current.model_dump()
         merged.update({key: value for key, value in changes.items() if key in domain_fields})
@@ -380,7 +419,9 @@ class Database:
                 """
                 UPDATE searches
                 SET name = ?, category = ?, query_json = ?, enabled = ?,
-                    baseline_initialized = ?, updated_at = ?, default_template_id = ?
+                    baseline_initialized = ?, updated_at = ?, default_template_id = ?,
+                    notify_ntfy = ?, notify_discord = ?, notify_email = ?,
+                    notify_desktop_sound = ?
                 WHERE id = ?
                 """,
                 (
@@ -391,6 +432,10 @@ class Database:
                     0 if reset_baseline else int(current.baseline_initialized),
                     timestamp,
                     validated.default_template_id,
+                    int(validated.notify_ntfy),
+                    int(validated.notify_discord),
+                    int(validated.notify_email),
+                    int(validated.notify_desktop_sound),
                     search_id,
                 ),
             )
@@ -429,6 +474,7 @@ class Database:
         notification_candidates: dict[str, Listing] = {}
         baseline_initializations = 0
         created_notification_count = 0
+        desktop_sound_requested = False
 
         async with self._write_lock, self._connect() as connection:
             await connection.execute("BEGIN IMMEDIATE")
@@ -547,6 +593,8 @@ class Database:
                             and listing.provider_listing_id in new_provider_ids
                         ):
                             notification_candidates[listing.provider_listing_id] = listing
+                            if search.notify_desktop_sound:
+                                desktop_sound_requested = True
 
                     await connection.execute(
                         """
@@ -584,6 +632,7 @@ class Database:
             created_notification_count=created_notification_count,
             new_listing_count=len(new_provider_ids),
             baseline_initializations=baseline_initializations,
+            desktop_sound_requested=desktop_sound_requested,
         )
 
     async def update_listing_enrichment(self, listing: Listing) -> None:
@@ -704,6 +753,122 @@ class Database:
                 WHERE id = ? AND status IN ('pending', 'failed')
                 """,
                 (timestamp, timestamp, error[:1000], notification_id),
+            )
+            await connection.commit()
+
+    async def load_channel_dispatch_state(
+        self, provider_listing_id: str
+    ) -> ChannelDispatchState | None:
+        """Load the per-search channel toggles and persisted per-channel delivery state."""
+
+        async with self._connect() as connection:
+            cursor = await connection.execute(
+                "SELECT id FROM listings WHERE provider_listing_id = ?",
+                (provider_listing_id,),
+            )
+            listing_row = await cursor.fetchone()
+            if listing_row is None:
+                return None
+            listing_id = listing_row["id"]
+
+            cursor = await connection.execute(
+                """
+                SELECT
+                    MAX(searches.notify_ntfy) AS notify_ntfy,
+                    MAX(searches.notify_discord) AS notify_discord,
+                    MAX(searches.notify_email) AS notify_email
+                FROM search_matches
+                JOIN searches ON searches.id = search_matches.search_id
+                WHERE search_matches.listing_id = ?
+                """,
+                (listing_id,),
+            )
+            toggles_row = await cursor.fetchone()
+            enabled_channels = {
+                channel
+                for channel, column in zip(
+                    PUSH_CHANNELS,
+                    ("notify_ntfy", "notify_discord", "notify_email"),
+                    strict=True,
+                )
+                if toggles_row is not None and toggles_row[column]
+            }
+
+            cursor = await connection.execute(
+                "SELECT channel, status FROM channel_deliveries WHERE listing_id = ?",
+                (listing_id,),
+            )
+            status_rows = await cursor.fetchall()
+
+        return ChannelDispatchState(
+            listing_id=listing_id,
+            enabled_channels=enabled_channels,
+            channel_statuses={row["channel"]: row["status"] for row in status_rows},
+        )
+
+    async def record_channel_delivery_attempt(
+        self,
+        listing_id: int,
+        channel: str,
+        *,
+        sent: bool,
+        error: str | None = None,
+    ) -> None:
+        if channel not in PUSH_CHANNELS:
+            raise ValueError(f"Unsupported notification channel: {channel}")
+        timestamp = to_db_timestamp()
+        status = "sent" if sent else "failed"
+        async with self._write_lock, self._connect() as connection:
+            await connection.execute(
+                """
+                INSERT INTO channel_deliveries(
+                    listing_id, channel, status, attempt_count,
+                    created_at, updated_at, last_attempt_at, sent_at, last_error
+                ) VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?)
+                ON CONFLICT(listing_id, channel) DO UPDATE SET
+                    status = excluded.status,
+                    attempt_count = channel_deliveries.attempt_count + 1,
+                    updated_at = excluded.updated_at,
+                    last_attempt_at = excluded.last_attempt_at,
+                    sent_at = CASE
+                        WHEN excluded.status = 'sent' THEN excluded.updated_at
+                        ELSE channel_deliveries.sent_at
+                    END,
+                    last_error = excluded.last_error
+                """,
+                (
+                    listing_id,
+                    channel,
+                    status,
+                    timestamp,
+                    timestamp,
+                    timestamp,
+                    timestamp if sent else None,
+                    None if sent else (error or "")[:1000],
+                ),
+            )
+            await connection.commit()
+
+    async def record_channel_delivery_skipped(self, listing_id: int, channel: str) -> None:
+        """Persist that one channel was not attempted, without touching a 'sent' outcome."""
+
+        if channel not in PUSH_CHANNELS:
+            raise ValueError(f"Unsupported notification channel: {channel}")
+        timestamp = to_db_timestamp()
+        async with self._write_lock, self._connect() as connection:
+            await connection.execute(
+                """
+                INSERT INTO channel_deliveries(
+                    listing_id, channel, status, attempt_count, created_at, updated_at
+                ) VALUES (?, ?, 'skipped', 0, ?, ?)
+                ON CONFLICT(listing_id, channel) DO UPDATE SET
+                    status = CASE
+                        WHEN channel_deliveries.status = 'sent' THEN channel_deliveries.status
+                        ELSE 'skipped'
+                    END,
+                    updated_at = excluded.updated_at
+                """,
+                (listing_id, channel, timestamp, timestamp),
             )
             await connection.commit()
 

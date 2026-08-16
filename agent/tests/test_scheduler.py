@@ -777,6 +777,74 @@ async def test_disabled_desktop_sound_is_not_called(
 
 
 @pytest.mark.asyncio
+async def test_search_with_desktop_sound_disabled_plays_no_chime(
+    database: Database,
+    search_data: SearchCreateData,
+    provider: FakeListingProvider,
+    scheduler_factory: Callable[..., Scheduler],
+    listing_factory: Callable[..., Listing],
+) -> None:
+    search = await database.create_search(replace(search_data, notify_desktop_sound=False))
+    provider.set_results(search.id, [])
+    sound = FakeDesktopNotificationSoundService()
+    scheduler = scheduler_factory(desktop_sound_service=sound)
+    await scheduler.run_cycle()
+    provider.set_results(search.id, [listing_factory("sound-opted-out")])
+
+    await scheduler.run_cycle()
+
+    assert sound.play_count == 0
+
+
+@pytest.mark.asyncio
+async def test_one_search_wanting_sound_plays_chime_even_if_another_matched_search_does_not(
+    database: Database,
+    search_data: SearchCreateData,
+    scheduler_factory: Callable[..., Scheduler],
+    listing_factory: Callable[..., Listing],
+) -> None:
+    quiet = await database.create_search(replace(search_data, notify_desktop_sound=False))
+    loud = await database.create_search(replace(search_data, name="BMW loud"))
+    scheduler = scheduler_factory()
+    await scheduler.run_cycle()
+
+    sound = FakeDesktopNotificationSoundService()
+    scheduler = scheduler_factory(desktop_sound_service=sound)
+    shared = listing_factory("shared-sound")
+    scheduler.provider.set_results(quiet.id, [shared])
+    scheduler.provider.set_results(loud.id, [shared])
+
+    await scheduler.run_cycle()
+
+    assert sound.play_count == 1
+
+
+@pytest.mark.asyncio
+async def test_desktop_sound_is_not_played_when_every_matching_search_opts_out(
+    database: Database,
+    search_data: SearchCreateData,
+    scheduler_factory: Callable[..., Scheduler],
+    listing_factory: Callable[..., Listing],
+) -> None:
+    quiet_a = await database.create_search(replace(search_data, notify_desktop_sound=False))
+    quiet_b = await database.create_search(
+        replace(search_data, name="BMW quiet", notify_desktop_sound=False)
+    )
+    scheduler = scheduler_factory()
+    await scheduler.run_cycle()
+
+    sound = FakeDesktopNotificationSoundService()
+    scheduler = scheduler_factory(desktop_sound_service=sound)
+    shared = listing_factory("shared-silent")
+    scheduler.provider.set_results(quiet_a.id, [shared])
+    scheduler.provider.set_results(quiet_b.id, [shared])
+
+    await scheduler.run_cycle()
+
+    assert sound.play_count == 0
+
+
+@pytest.mark.asyncio
 async def test_restart_does_not_play_sound_for_old_listing(
     database: Database,
     search_data: SearchCreateData,

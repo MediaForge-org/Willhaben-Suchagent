@@ -50,6 +50,60 @@ class Settings(BaseSettings):
             "WILLHABEN_NTFY_TIMEOUT_SECONDS",
         ),
     )
+    discord_enabled: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("DISCORD_ENABLED", "WILLHABEN_DISCORD_ENABLED"),
+    )
+    discord_webhook_url: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("DISCORD_WEBHOOK_URL", "WILLHABEN_DISCORD_WEBHOOK_URL"),
+    )
+    discord_timeout_seconds: float = Field(
+        default=10,
+        gt=0,
+        validation_alias=AliasChoices(
+            "DISCORD_TIMEOUT_SECONDS", "WILLHABEN_DISCORD_TIMEOUT_SECONDS"
+        ),
+    )
+    email_enabled: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("EMAIL_ENABLED", "WILLHABEN_EMAIL_ENABLED"),
+    )
+    email_smtp_host: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("EMAIL_SMTP_HOST", "WILLHABEN_EMAIL_SMTP_HOST"),
+    )
+    email_smtp_port: int = Field(
+        default=587,
+        ge=1,
+        le=65535,
+        validation_alias=AliasChoices("EMAIL_SMTP_PORT", "WILLHABEN_EMAIL_SMTP_PORT"),
+    )
+    email_smtp_username: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("EMAIL_SMTP_USERNAME", "WILLHABEN_EMAIL_SMTP_USERNAME"),
+    )
+    email_smtp_password: SecretStr | None = Field(
+        default=None,
+        validation_alias=AliasChoices("EMAIL_SMTP_PASSWORD", "WILLHABEN_EMAIL_SMTP_PASSWORD"),
+    )
+    email_from_address: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("EMAIL_FROM_ADDRESS", "WILLHABEN_EMAIL_FROM_ADDRESS"),
+    )
+    email_to_address: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("EMAIL_TO_ADDRESS", "WILLHABEN_EMAIL_TO_ADDRESS"),
+    )
+    email_use_tls: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("EMAIL_USE_TLS", "WILLHABEN_EMAIL_USE_TLS"),
+    )
+    email_timeout_seconds: float = Field(
+        default=10,
+        gt=0,
+        validation_alias=AliasChoices("EMAIL_TIMEOUT_SECONDS", "WILLHABEN_EMAIL_TIMEOUT_SECONDS"),
+    )
 
     model_config = SettingsConfigDict(
         env_prefix="WILLHABEN_",

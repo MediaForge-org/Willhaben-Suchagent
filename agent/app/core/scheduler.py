@@ -244,7 +244,7 @@ class Scheduler:
                     successful_results.append((outcome.search, outcome.listings or []))
 
             persistence = await self.database.persist_cycle_results(successful_results)
-            if persistence.created_notification_count > 0 and self.desktop_sound_service.enabled:
+            if persistence.desktop_sound_requested and self.desktop_sound_service.enabled:
                 try:
                     await self.desktop_sound_service.play_new_listing_chime()
                 except asyncio.CancelledError:

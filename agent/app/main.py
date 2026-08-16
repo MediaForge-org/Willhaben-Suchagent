@@ -13,7 +13,13 @@ from agent.app.core.health import HealthState
 from agent.app.core.logging import configure_logging
 from agent.app.core.provider import ListingProvider
 from agent.app.core.scheduler import Scheduler
-from agent.app.notifications.service import NotificationService, NtfyNotificationService
+from agent.app.notifications.dispatcher import NotificationDispatcher
+from agent.app.notifications.service import (
+    DiscordNotificationService,
+    EmailNotificationService,
+    NotificationService,
+    NtfyNotificationService,
+)
 from agent.app.notifications.sound import (
     DesktopNotificationSoundService,
     create_desktop_sound_service,
@@ -42,18 +48,46 @@ def create_app(
         max_redirects=resolved_settings.marketplace_max_redirects,
         max_response_bytes=resolved_settings.marketplace_max_response_bytes,
     )
-    resolved_notifications = notification_service or NtfyNotificationService(
-        enabled=resolved_settings.ntfy_enabled,
-        base_url=resolved_settings.ntfy_base_url,
-        topic=resolved_settings.ntfy_topic,
-        token=(
-            resolved_settings.ntfy_token.get_secret_value()
-            if resolved_settings.ntfy_token is not None
-            else None
-        ),
-        timeout_seconds=resolved_settings.ntfy_timeout_seconds,
-    )
     database = Database(resolved_settings.database_path)
+    notification_channels: dict[str, NotificationService] = {}
+    if notification_service is None:
+        notification_channels = {
+            "ntfy": NtfyNotificationService(
+                enabled=resolved_settings.ntfy_enabled,
+                base_url=resolved_settings.ntfy_base_url,
+                topic=resolved_settings.ntfy_topic,
+                token=(
+                    resolved_settings.ntfy_token.get_secret_value()
+                    if resolved_settings.ntfy_token is not None
+                    else None
+                ),
+                timeout_seconds=resolved_settings.ntfy_timeout_seconds,
+            ),
+            "discord": DiscordNotificationService(
+                enabled=resolved_settings.discord_enabled,
+                webhook_url=resolved_settings.discord_webhook_url,
+                timeout_seconds=resolved_settings.discord_timeout_seconds,
+            ),
+            "email": EmailNotificationService(
+                enabled=resolved_settings.email_enabled,
+                smtp_host=resolved_settings.email_smtp_host,
+                smtp_port=resolved_settings.email_smtp_port,
+                username=resolved_settings.email_smtp_username,
+                password=(
+                    resolved_settings.email_smtp_password.get_secret_value()
+                    if resolved_settings.email_smtp_password is not None
+                    else None
+                ),
+                from_address=resolved_settings.email_from_address,
+                to_address=resolved_settings.email_to_address,
+                use_tls=resolved_settings.email_use_tls,
+                timeout_seconds=resolved_settings.email_timeout_seconds,
+            ),
+        }
+    resolved_notifications = notification_service or NotificationDispatcher(
+        database=database,
+        channels=notification_channels,
+    )
     resolved_desktop_sound = desktop_sound_service or create_desktop_sound_service(
         enabled=resolved_settings.desktop_sound_enabled,
         sound_id=resolved_settings.desktop_sound_id,
@@ -125,6 +159,7 @@ def create_app(
     app.state.scheduler = scheduler
     app.state.provider = resolved_provider
     app.state.notification_service = resolved_notifications
+    app.state.notification_channels = notification_channels
     app.state.desktop_sound_service = resolved_desktop_sound
     app.include_router(router)
     return app

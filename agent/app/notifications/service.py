@@ -1,5 +1,8 @@
+import asyncio
+import smtplib
 from abc import ABC, abstractmethod
 from decimal import Decimal
+from email.message import EmailMessage
 from urllib.parse import quote
 
 import httpx
@@ -135,11 +138,152 @@ class NtfyNotificationService(NotificationService):
 
     @staticmethod
     def _format_price(price: Decimal) -> str:
-        formatted = format(price, "f")
-        if "." in formatted:
-            formatted = formatted.rstrip("0").rstrip(".")
-        return formatted
+        return _format_price(price)
 
     async def close(self) -> None:
         if self._owns_client:
             await self._client.aclose()
+
+
+def _format_price(price: Decimal) -> str:
+    formatted = format(price, "f")
+    if "." in formatted:
+        formatted = formatted.rstrip("0").rstrip(".")
+    return formatted
+
+
+def _listing_summary_lines(listing: Listing) -> list[str]:
+    parts = [listing.article_label]
+    if listing.price is not None:
+        parts.append(f"{_format_price(listing.price)} €")
+    if listing.seller_name:
+        label = "Anbieter" if listing.seller_type is SellerType.COMMERCIAL else "Verkäufer"
+        parts.append(f"{label}: {listing.seller_name}")
+    if listing.location:
+        parts.append(f"Ort: {listing.location}")
+    if listing.condition:
+        parts.append(f"Zustand: {listing.condition}")
+    return parts
+
+
+class DiscordNotificationService(NotificationService):
+    """Publish listing notifications to one Discord channel via an incoming webhook."""
+
+    TEST_MESSAGE = "Willhaben-Suchagent – Test erfolgreich"
+
+    def __init__(
+        self,
+        *,
+        enabled: bool,
+        webhook_url: str | None,
+        timeout_seconds: float = 10,
+        client: httpx.AsyncClient | None = None,
+    ) -> None:
+        normalized_url = webhook_url.strip() if webhook_url else ""
+        self.enabled = bool(enabled and normalized_url)
+        self.disabled_reason = None
+        if not enabled:
+            self.disabled_reason = "DISCORD_ENABLED is false"
+        elif not normalized_url:
+            self.disabled_reason = "DISCORD_WEBHOOK_URL is not configured"
+
+        self._webhook_url = normalized_url
+        self._timeout = httpx.Timeout(timeout_seconds)
+        self._client = client or httpx.AsyncClient()
+        self._owns_client = client is None
+
+    async def notify_new_listing(self, listing: Listing) -> None:
+        lines = _listing_summary_lines(listing)
+        content = "**Neues Willhaben-Inserat**\n" + "\n".join(lines) + f"\n{listing.url}"
+        await self._post(content)
+
+    async def notify_test(self) -> None:
+        await self._post(self.TEST_MESSAGE)
+
+    async def _post(self, content: str) -> None:
+        if not self.enabled:
+            raise NotificationDisabledError(self.disabled_reason or "Discord is disabled")
+        try:
+            response = await self._client.post(
+                self._webhook_url,
+                json={"content": content},
+                timeout=self._timeout,
+            )
+            response.raise_for_status()
+        except httpx.HTTPError as error:
+            raise NotificationDeliveryError("Discord webhook request failed") from error
+
+    async def close(self) -> None:
+        if self._owns_client:
+            await self._client.aclose()
+
+
+class EmailNotificationService(NotificationService):
+    """Publish listing notifications as plain-text e-mails via SMTP."""
+
+    TEST_SUBJECT = "Willhaben-Suchagent – Test erfolgreich"
+
+    def __init__(
+        self,
+        *,
+        enabled: bool,
+        smtp_host: str | None,
+        smtp_port: int = 587,
+        username: str | None = None,
+        password: str | None = None,
+        from_address: str | None,
+        to_address: str | None,
+        use_tls: bool = True,
+        timeout_seconds: float = 10,
+    ) -> None:
+        normalized_host = smtp_host.strip() if smtp_host else ""
+        normalized_from = from_address.strip() if from_address else ""
+        normalized_to = to_address.strip() if to_address else ""
+        self.enabled = bool(enabled and normalized_host and normalized_from and normalized_to)
+        self.disabled_reason = None
+        if not enabled:
+            self.disabled_reason = "EMAIL_ENABLED is false"
+        elif not normalized_host:
+            self.disabled_reason = "EMAIL_SMTP_HOST is not configured"
+        elif not normalized_from:
+            self.disabled_reason = "EMAIL_FROM_ADDRESS is not configured"
+        elif not normalized_to:
+            self.disabled_reason = "EMAIL_TO_ADDRESS is not configured"
+
+        self._smtp_host = normalized_host
+        self._smtp_port = smtp_port
+        self._username = username
+        self._password = password
+        self._from_address = normalized_from
+        self._to_address = normalized_to
+        self._use_tls = use_tls
+        self._timeout_seconds = timeout_seconds
+
+    async def notify_new_listing(self, listing: Listing) -> None:
+        lines = _listing_summary_lines(listing)
+        body = "\n".join([*lines, "", str(listing.url)])
+        await self._send(subject=f"Neues Willhaben-Inserat: {listing.article_label}", body=body)
+
+    async def notify_test(self) -> None:
+        await self._send(subject=self.TEST_SUBJECT, body=self.TEST_SUBJECT)
+
+    async def _send(self, *, subject: str, body: str) -> None:
+        if not self.enabled:
+            raise NotificationDisabledError(self.disabled_reason or "E-Mail is disabled")
+        message = EmailMessage()
+        message["Subject"] = subject
+        message["From"] = self._from_address
+        message["To"] = self._to_address
+        message.set_content(body)
+        try:
+            await asyncio.to_thread(self._send_sync, message)
+        except (OSError, smtplib.SMTPException) as error:
+            raise NotificationDeliveryError("SMTP request failed") from error
+
+    def _send_sync(self, message: EmailMessage) -> None:
+        with smtplib.SMTP(self._smtp_host, self._smtp_port, timeout=self._timeout_seconds) as smtp:
+            if self._use_tls:
+                smtp.starttls()
+            if self._username and self._password:
+                smtp.login(self._username, self._password)
+            smtp.send_message(message)
