@@ -437,6 +437,60 @@ async def test_scheduler_cadence_is_measured_from_previous_cycle_completion(
 
 
 @pytest.mark.asyncio
+async def test_large_monotonic_time_jump_does_not_cause_catch_up_flood(
+    monkeypatch: pytest.MonkeyPatch,
+    database: Database,
+    search_data: SearchCreateData,
+) -> None:
+    """A suspend/resume (or clock jump) must trigger at most one extra cycle,
+    never a burst of "missed" cycles being replayed back-to-back."""
+    import agent.app.core.scheduler as scheduler_module
+
+    search = await database.create_search(search_data)
+    provider = FakeListingProvider()
+    provider.set_results(search.id, [])
+    scheduler = Scheduler(
+        database=database,
+        provider=provider,
+        notification_service=FakeNotificationService(),
+        health=HealthState(),
+        cycle_interval_seconds=0.05,
+        max_concurrent_requests=1,
+    )
+
+    real_monotonic = scheduler_module.monotonic
+    clock_offset = 0.0
+
+    def jumping_monotonic() -> float:
+        return real_monotonic() + clock_offset
+
+    monkeypatch.setattr(scheduler_module, "monotonic", jumping_monotonic)
+
+    scheduler.start()
+    try:
+        async with asyncio.timeout(1):
+            await provider.wait_for_call_count(1)
+        # Simulate a huge forward time jump (e.g. laptop suspended for hours)
+        # while the scheduler is sleeping between cycles.
+        clock_offset = 100_000.0
+        async with asyncio.timeout(1):
+            await provider.wait_for_call_count(4)
+    finally:
+        await scheduler.stop()
+
+    # The jump may trigger one immediate "resume" cycle, but every cycle
+    # after that must still be spaced roughly one real interval apart -
+    # never a tight burst of many cycles firing back-to-back.
+    gaps = [
+        later - earlier
+        for earlier, later in zip(
+            provider.call_started_at[1:3], provider.call_started_at[2:4], strict=True
+        )
+    ]
+    assert all(gap >= 0.03 for gap in gaps), gaps
+
+
+@pytest.mark.asyncio
 async def test_completed_cycle_publishes_authoritative_next_due_time(
     scheduler_factory: Callable[..., Scheduler],
 ) -> None:

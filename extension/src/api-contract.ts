@@ -1,9 +1,18 @@
 import type {
   AgentStatus,
   AgentSettings,
+  BackupDocument,
+  BackupImportSummary,
+  ChannelTestResult,
+  GlobalNotificationSettings,
+  GlobalNotificationSettingsPatch,
+  ImportedSearchDraft,
   Listing,
   MarketplaceOptions,
   MessageTemplate,
+  NotificationTarget,
+  NotificationTargetCreate,
+  NotificationTargetPatch,
   Search,
 } from "./types";
 
@@ -37,7 +46,7 @@ export class ApiDataError extends ApiError {
   }
 }
 
-export type NativeHostFailure = "not_installed" | "not_startable";
+export type NativeHostFailure = "not_installed" | "not_startable" | "outdated";
 
 export class ApiNativeHostError extends ApiError {
   constructor(
@@ -79,4 +88,18 @@ export interface ApiService {
   deleteTemplate(id: number): Promise<void>;
   renderTemplate(templateId: number, listingId: number): Promise<{ rendered_text: string }>;
   testDesktopSound(soundId?: string): Promise<{ status: string; message: string }>;
+  updateNotificationSettings(
+    payload: GlobalNotificationSettingsPatch,
+  ): Promise<GlobalNotificationSettings>;
+  importSearchUrl(url: string): Promise<ImportedSearchDraft>;
+  notificationTargets(): Promise<NotificationTarget[]>;
+  createNotificationTarget(payload: NotificationTargetCreate): Promise<NotificationTarget>;
+  updateNotificationTarget(
+    id: number,
+    payload: NotificationTargetPatch,
+  ): Promise<NotificationTarget>;
+  deleteNotificationTarget(id: number): Promise<{ deleted: boolean; searches_affected: number }>;
+  testNotificationTarget(id: number): Promise<ChannelTestResult>;
+  exportBackup(): Promise<BackupDocument>;
+  importBackup(document: BackupDocument): Promise<BackupImportSummary>;
 }

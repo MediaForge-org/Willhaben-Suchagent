@@ -1,15 +1,25 @@
 from fastapi import APIRouter, HTTPException, Query, Request, Response, status
 
+from agent.app._version import __version__
 from agent.app.api.schemas import (
     AgentSettingsPatch,
     AgentSettingsResponse,
+    BackupImportSummaryResponse,
+    ChannelTestResponse,
     DesktopSoundOption,
     DesktopSoundTestRequest,
     DesktopSoundTestResponse,
+    GlobalNotificationSettingsPatch,
+    GlobalNotificationSettingsResponse,
     HealthResponse,
+    ImportedSearchDraftResponse,
+    ImportSearchUrlRequest,
     MarketplaceOption,
     MarketplaceOptionsResponse,
-    NotificationTestResponse,
+    NotificationTargetCreate,
+    NotificationTargetDeleteResponse,
+    NotificationTargetPatch,
+    NotificationTargetResponse,
     RecentListingResponse,
     SearchCreate,
     SearchPatch,
@@ -21,18 +31,34 @@ from agent.app.api.schemas import (
     TemplateRenderResponse,
     TemplateResponse,
 )
+from agent.app.backup.service import (
+    BackupValidationError,
+    export_backup,
+    import_backup,
+    parse_backup_document,
+)
 from agent.app.core.templates import render_template, validate_template_body
-from agent.app.core.time import utc_now
 from agent.app.notifications.service import (
+    InvalidChannelConfigurationError,
     NotificationDeliveryError,
     NotificationDisabledError,
     NotificationService,
 )
+from agent.app.notifications.settings_manager import NotificationSettingsManager
 from agent.app.notifications.sound import SOUND_VARIANTS, DesktopNotificationSoundService
+from agent.app.notifications.targets import (
+    NotificationTargetNotFoundError,
+    NotificationTargetService,
+    NotificationTargetSnapshot,
+)
 from agent.app.storage.database import Database, SearchCreateData, TemplateCreateData
 from agent.app.willhaben.marketplace_search import (
     SUPPORTED_MARKETPLACE_CATEGORIES,
     SUPPORTED_MARKETPLACE_LOCATIONS,
+)
+from agent.app.willhaben.search_url_import import (
+    InvalidSearchUrlError,
+    parse_marketplace_search_url,
 )
 
 router = APIRouter()
@@ -48,6 +74,58 @@ def get_notification_service(request: Request) -> NotificationService:
 
 def get_desktop_sound_service(request: Request) -> DesktopNotificationSoundService:
     return request.app.state.desktop_sound_service
+
+
+def get_notification_settings_manager(request: Request) -> NotificationSettingsManager | None:
+    return getattr(request.app.state, "notification_settings_manager", None)
+
+
+def get_notification_target_service(request: Request) -> NotificationTargetService | None:
+    return getattr(request.app.state, "notification_target_service", None)
+
+
+_UNAVAILABLE_NOTIFICATIONS = HTTPException(
+    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+    detail="Benachrichtigungseinstellungen sind in diesem Modus nicht verfügbar.",
+)
+
+
+async def _global_notifications_response(
+    manager: NotificationSettingsManager,
+) -> GlobalNotificationSettingsResponse:
+    snapshot = await manager.snapshot()
+    return GlobalNotificationSettingsResponse(
+        ntfy_timeout_seconds=snapshot.ntfy_timeout_seconds,
+        discord_timeout_seconds=snapshot.discord_timeout_seconds,
+        email_smtp_host=snapshot.email_smtp_host,
+        email_smtp_port=snapshot.email_smtp_port,
+        email_smtp_username=snapshot.email_smtp_username,
+        email_smtp_password_configured=snapshot.email_smtp_password_configured,
+        email_from_address=snapshot.email_from_address,
+        email_encryption=snapshot.email_encryption,  # type: ignore[arg-type]
+        email_timeout_seconds=snapshot.email_timeout_seconds,
+    )
+
+
+def _target_response(
+    snapshot: NotificationTargetSnapshot, *, usage_count: int = 0
+) -> NotificationTargetResponse:
+    return NotificationTargetResponse(
+        id=snapshot.id,
+        type=snapshot.type,  # type: ignore[arg-type]
+        name=snapshot.name,
+        enabled=snapshot.enabled,
+        configured=snapshot.configured,
+        ntfy_base_url=snapshot.ntfy_base_url,
+        ntfy_topic_configured=snapshot.ntfy_topic_configured,
+        ntfy_token_configured=snapshot.ntfy_token_configured,
+        discord_webhook_configured=snapshot.discord_webhook_configured,
+        email_address=snapshot.email_address,
+        email_address_masked=snapshot.email_address_masked,
+        usage_count=usage_count,
+        created_at=snapshot.created_at,
+        updated_at=snapshot.updated_at,
+    )
 
 
 @router.get("/health", response_model=HealthResponse, tags=["health"])
@@ -77,10 +155,6 @@ async def application_status(request: Request) -> StatusResponse:
     database = get_database(request)
     notifications = get_notification_service(request)
     desktop_sound = get_desktop_sound_service(request)
-    channels = request.app.state.notification_channels
-    ntfy_channel = channels.get("ntfy")
-    discord_channel = channels.get("discord")
-    email_channel = channels.get("email")
     persisted_last_notification = await database.last_successful_notification_at()
     last_notification = state.last_successful_notification_at
     if persisted_last_notification is not None and (
@@ -89,6 +163,7 @@ async def application_status(request: Request) -> StatusResponse:
         last_notification = persisted_last_notification
     return StatusResponse(
         **base.model_dump(),
+        app_version=__version__,
         environment=settings.app_environment,
         scheduler_running=state.scheduler_running,
         cycle_interval_seconds=settings.cycle_interval_seconds,
@@ -100,18 +175,8 @@ async def application_status(request: Request) -> StatusResponse:
         pending_notifications=await database.count_notifications_with_status("pending"),
         failed_notifications=await database.count_notifications_with_status("failed"),
         last_successful_notification_at=last_notification,
-        ntfy_enabled=ntfy_channel.enabled if ntfy_channel else notifications.enabled,
-        ntfy_disabled_reason=(
-            ntfy_channel.disabled_reason if ntfy_channel else notifications.disabled_reason
-        ),
-        discord_enabled=discord_channel.enabled if discord_channel else False,
-        discord_disabled_reason=(
-            discord_channel.disabled_reason if discord_channel else "Discord is not configured"
-        ),
-        email_enabled=email_channel.enabled if email_channel else False,
-        email_disabled_reason=(
-            email_channel.disabled_reason if email_channel else "E-Mail is not configured"
-        ),
+        notifications_enabled=notifications.enabled,
+        notifications_disabled_reason=notifications.disabled_reason,
         desktop_sound_enabled=desktop_sound.enabled,
         desktop_sound_id=desktop_sound.sound_id,
         desktop_sound_available=desktop_sound.available,
@@ -120,11 +185,13 @@ async def application_status(request: Request) -> StatusResponse:
     )
 
 
-def _settings_response(
+async def _settings_response(
+    request: Request,
     *,
     enabled: bool,
     sound_id: str,
 ) -> AgentSettingsResponse:
+    manager = get_notification_settings_manager(request)
     return AgentSettingsResponse(
         desktop_sound_enabled=enabled,
         desktop_sound_id=sound_id,
@@ -132,13 +199,16 @@ def _settings_response(
             DesktopSoundOption(id=variant.id, name=variant.name)
             for variant in SOUND_VARIANTS.values()
         ],
+        notifications=(await _global_notifications_response(manager)) if manager else None,
     )
 
 
 @router.get("/api/v1/settings", response_model=AgentSettingsResponse, tags=["settings"])
 async def agent_settings(request: Request) -> AgentSettingsResponse:
     preferences = await get_database(request).get_desktop_sound_preferences()
-    return _settings_response(enabled=preferences.enabled, sound_id=preferences.sound_id)
+    return await _settings_response(
+        request, enabled=preferences.enabled, sound_id=preferences.sound_id
+    )
 
 
 @router.patch("/api/v1/settings", response_model=AgentSettingsResponse, tags=["settings"])
@@ -160,7 +230,145 @@ async def update_agent_settings(
         enabled=preferences.enabled,
         sound_id=preferences.sound_id,
     )
-    return _settings_response(enabled=preferences.enabled, sound_id=preferences.sound_id)
+    return await _settings_response(
+        request, enabled=preferences.enabled, sound_id=preferences.sound_id
+    )
+
+
+@router.patch(
+    "/api/v1/settings/notifications",
+    response_model=GlobalNotificationSettingsResponse,
+    tags=["settings"],
+)
+async def update_notification_settings(
+    payload: GlobalNotificationSettingsPatch,
+    request: Request,
+) -> GlobalNotificationSettingsResponse:
+    manager = get_notification_settings_manager(request)
+    if manager is None:
+        raise _UNAVAILABLE_NOTIFICATIONS
+    changes = payload.model_dump(exclude_unset=True)
+    if not changes:
+        raise HTTPException(status_code=422, detail="Mindestens eine Einstellung ist erforderlich")
+    try:
+        await manager.update_global(changes)
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    return await _global_notifications_response(manager)
+
+
+# -- Notification targets (reusable ntfy/Discord/e-mail destinations) ------------------
+
+
+@router.get(
+    "/api/v1/notification-targets",
+    response_model=list[NotificationTargetResponse],
+    tags=["notifications"],
+)
+async def list_notification_targets(request: Request) -> list[NotificationTargetResponse]:
+    service = get_notification_target_service(request)
+    if service is None:
+        raise _UNAVAILABLE_NOTIFICATIONS
+    snapshots = await service.list()
+    return [
+        _target_response(snapshot, usage_count=await service.usage_count(snapshot.id))
+        for snapshot in snapshots
+    ]
+
+
+@router.post(
+    "/api/v1/notification-targets",
+    response_model=NotificationTargetResponse,
+    status_code=status.HTTP_201_CREATED,
+    tags=["notifications"],
+)
+async def create_notification_target(
+    payload: NotificationTargetCreate, request: Request
+) -> NotificationTargetResponse:
+    service = get_notification_target_service(request)
+    if service is None:
+        raise _UNAVAILABLE_NOTIFICATIONS
+    try:
+        snapshot = await service.create(payload.model_dump(exclude_unset=True))
+    except InvalidChannelConfigurationError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    return _target_response(snapshot)
+
+
+@router.patch(
+    "/api/v1/notification-targets/{target_id}",
+    response_model=NotificationTargetResponse,
+    tags=["notifications"],
+)
+async def update_notification_target(
+    target_id: int, payload: NotificationTargetPatch, request: Request
+) -> NotificationTargetResponse:
+    service = get_notification_target_service(request)
+    if service is None:
+        raise _UNAVAILABLE_NOTIFICATIONS
+    changes = payload.model_dump(exclude_unset=True)
+    if not changes:
+        raise HTTPException(status_code=422, detail="Mindestens ein Feld ist erforderlich")
+    try:
+        snapshot = await service.update(target_id, changes)
+    except NotificationTargetNotFoundError as error:
+        raise HTTPException(status_code=404, detail="Notification target not found") from error
+    except InvalidChannelConfigurationError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    return _target_response(snapshot, usage_count=await service.usage_count(target_id))
+
+
+@router.delete(
+    "/api/v1/notification-targets/{target_id}",
+    response_model=NotificationTargetDeleteResponse,
+    tags=["notifications"],
+)
+async def delete_notification_target(
+    target_id: int, request: Request
+) -> NotificationTargetDeleteResponse:
+    service = get_notification_target_service(request)
+    if service is None:
+        raise _UNAVAILABLE_NOTIFICATIONS
+    try:
+        usage_count = await service.delete(target_id)
+    except NotificationTargetNotFoundError as error:
+        raise HTTPException(status_code=404, detail="Notification target not found") from error
+    return NotificationTargetDeleteResponse(deleted=True, searches_affected=usage_count)
+
+
+@router.post(
+    "/api/v1/notification-targets/{target_id}/test",
+    response_model=ChannelTestResponse,
+    tags=["notifications"],
+)
+async def test_notification_target(target_id: int, request: Request) -> ChannelTestResponse:
+    service = get_notification_target_service(request)
+    if service is None:
+        raise _UNAVAILABLE_NOTIFICATIONS
+    try:
+        await service.get(target_id)
+    except NotificationTargetNotFoundError as error:
+        raise HTTPException(status_code=404, detail="Notification target not found") from error
+    channel_service = request.app.state.notification_target_registry.get(target_id)
+    if channel_service is None or not channel_service.enabled:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(channel_service.disabled_reason if channel_service else None)
+            or "Dieses Ziel ist noch nicht eingerichtet.",
+        )
+    try:
+        await channel_service.notify_test()
+    except NotificationDisabledError as error:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(error)
+        ) from error
+    except NotificationDeliveryError as error:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(error)) from error
+    return ChannelTestResponse(status="sent", message="Willhaben-Suchagent – Test erfolgreich")
 
 
 @router.get("/api/v1/searches", response_model=list[SearchResponse], tags=["searches"])
@@ -180,8 +388,18 @@ async def create_search(payload: SearchCreate, request: Request) -> SearchRespon
     if payload.default_template_id is not None:
         if await database.get_template(payload.default_template_id) is None:
             raise HTTPException(status_code=422, detail="Standard-Template wurde nicht gefunden")
+    await _validate_target_ids_or_422(database, payload.notification_target_ids)
     created = await database.create_search(SearchCreateData(**payload.model_dump()))
     return SearchResponse.model_validate(created.model_dump())
+
+
+async def _validate_target_ids_or_422(database: Database, target_ids: list[int]) -> None:
+    for target_id in target_ids:
+        if await database.get_notification_target(target_id) is None:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Benachrichtigungsziel {target_id} wurde nicht gefunden",
+            )
 
 
 @router.get("/api/v1/searches/{search_id}", response_model=SearchResponse, tags=["searches"])
@@ -205,9 +423,6 @@ async def update_search(
         "enabled",
         "query",
         "category_filters",
-        "notify_ntfy",
-        "notify_discord",
-        "notify_email",
         "notify_desktop_sound",
     }
     if any(value is None for key, value in changes.items() if key in required_fields):
@@ -216,6 +431,8 @@ async def update_search(
     template_id = changes.get("default_template_id")
     if template_id is not None and await database.get_template(template_id) is None:
         raise HTTPException(status_code=422, detail="Standard-Template wurde nicht gefunden")
+    if "notification_target_ids" in changes and changes["notification_target_ids"] is not None:
+        await _validate_target_ids_or_422(database, changes["notification_target_ids"])
     try:
         updated = await database.update_search(search_id, changes)
     except ValueError as error:
@@ -288,6 +505,61 @@ async def marketplace_options() -> MarketplaceOptionsResponse:
             MarketplaceOption(label=location, value=location)
             for location in SUPPORTED_MARKETPLACE_LOCATIONS
         ],
+    )
+
+
+@router.post(
+    "/api/v1/marketplace/import-search-url",
+    response_model=ImportedSearchDraftResponse,
+    tags=["searches"],
+)
+async def import_marketplace_search_url(
+    payload: ImportSearchUrlRequest,
+) -> ImportedSearchDraftResponse:
+    try:
+        draft = parse_marketplace_search_url(payload.url)
+    except InvalidSearchUrlError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    return ImportedSearchDraftResponse(
+        category_path=draft.category_path,
+        category_label=draft.category_label,
+        query=draft.query,
+        location=draft.location,
+        price_min=draft.price_min,
+        price_max=draft.price_max,
+        unsupported_filters=draft.unsupported_filters,
+    )
+
+
+@router.get("/api/v1/backup/export", tags=["backup"])
+async def export_backup_route(request: Request) -> dict[str, object]:
+    return await export_backup(get_database(request))
+
+
+@router.post(
+    "/api/v1/backup/import",
+    response_model=BackupImportSummaryResponse,
+    tags=["backup"],
+)
+async def import_backup_route(request: Request) -> BackupImportSummaryResponse:
+    try:
+        document = await request.json()
+    except ValueError as error:
+        raise HTTPException(
+            status_code=422, detail="Die Backup-Datei ist kein gültiges JSON."
+        ) from error
+    try:
+        backup = parse_backup_document(document)
+    except BackupValidationError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    summary = await import_backup(get_database(request), backup)
+    return BackupImportSummaryResponse(
+        templates_created=summary.templates_created,
+        templates_skipped=summary.templates_skipped,
+        notification_targets_created=summary.notification_targets_created,
+        notification_targets_skipped=summary.notification_targets_skipped,
+        searches_created=summary.searches_created,
+        searches_skipped=summary.searches_skipped,
     )
 
 
@@ -375,45 +647,6 @@ async def render_message_template(
         template_id=template.id,
         listing_id=payload.listing_id,
         rendered_text=render_template(template.body, listing),
-    )
-
-
-@router.post(
-    "/api/v1/notifications/test",
-    response_model=NotificationTestResponse,
-    tags=["notifications"],
-)
-async def test_notification(request: Request) -> NotificationTestResponse:
-    notifications = get_notification_service(request)
-    if not notifications.enabled:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=notifications.disabled_reason or "ntfy is disabled",
-        )
-    try:
-        await notifications.notify_test()
-    except NotificationDisabledError as error:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=str(error),
-        ) from error
-    except NotificationDeliveryError as error:
-        request.app.state.health.last_notification_error = type(error).__name__
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail="ntfy test notification failed",
-        ) from error
-    except Exception as error:
-        request.app.state.health.last_notification_error = type(error).__name__
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail="Notification test failed",
-        ) from error
-    request.app.state.health.last_notification_error = None
-    request.app.state.health.last_successful_notification_at = utc_now()
-    return NotificationTestResponse(
-        status="sent",
-        message="Willhaben-Suchagent – Test erfolgreich",
     )
 
 

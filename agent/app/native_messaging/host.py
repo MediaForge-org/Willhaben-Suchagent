@@ -18,6 +18,13 @@ AGENT_BASE_URL = "http://127.0.0.1:8000"
 MAX_MESSAGE_BYTES = 1_048_576
 REQUEST_TIMEOUT_SECONDS = 10.0
 
+# Bumped whenever the requestId/response envelope shape or its semantics change.
+# The extension compares this against its own expected value on every response so a
+# stale, previously-installed native host (old code, new extension) is reported as a
+# clear "please reinstall/update the local connection" error instead of a silent
+# partial failure. Independent of the application version.
+PROTOCOL_VERSION = 1
+
 BrokerResponse = dict[str, Any]
 
 
@@ -97,14 +104,58 @@ class LocalAgentClient:
             "api.searches.list": AgentRequest("GET", "/api/v1/searches"),
             "api.templates.list": AgentRequest("GET", "/api/v1/templates"),
             "api.marketplace.options": AgentRequest("GET", "/api/v1/marketplace/options"),
+            "api.backup.export": AgentRequest("GET", "/api/v1/backup/export"),
         }
         if operation in static_operations:
             _require_keys(message, {"type"})
             return static_operations[operation]
 
+        if operation == "api.backup.import":
+            _require_keys(message, {"type", "payload"})
+            return AgentRequest("POST", "/api/v1/backup/import", _backup_import_payload(message))
+
         if operation == "api.settings.update":
             _require_keys(message, {"type", "payload"})
             return AgentRequest("PATCH", "/api/v1/settings", _settings_payload(message))
+        if operation == "api.settings.notifications.update":
+            _require_keys(message, {"type", "payload"})
+            return AgentRequest(
+                "PATCH",
+                "/api/v1/settings/notifications",
+                _global_notifications_settings_payload(message),
+            )
+        if operation == "api.notificationTargets.list":
+            _require_keys(message, {"type"})
+            return AgentRequest("GET", "/api/v1/notification-targets")
+        if operation == "api.notificationTargets.create":
+            _require_keys(message, {"type", "payload"})
+            return AgentRequest(
+                "POST", "/api/v1/notification-targets", _notification_target_payload(message)
+            )
+        if operation == "api.notificationTargets.update":
+            _require_keys(message, {"type", "id", "payload"})
+            identifier = _identifier(message)
+            return AgentRequest(
+                "PATCH",
+                f"/api/v1/notification-targets/{identifier}",
+                _notification_target_payload(message, allow_partial=True),
+            )
+        if operation == "api.notificationTargets.delete":
+            _require_keys(message, {"type", "id"})
+            return AgentRequest("DELETE", f"/api/v1/notification-targets/{_identifier(message)}")
+        if operation == "api.notificationTargets.test":
+            _require_keys(message, {"type", "id"})
+            return AgentRequest("POST", f"/api/v1/notification-targets/{_identifier(message)}/test")
+        if operation == "api.marketplace.import_search_url":
+            _require_keys(message, {"type", "url"})
+            url = message.get("url")
+            if not isinstance(url, str) or not url or len(url) > 2000:
+                raise ValueError("Ungültige API-Broker-Anfrage.")
+            return AgentRequest(
+                "POST",
+                "/api/v1/marketplace/import-search-url",
+                {"url": url},
+            )
         if operation == "api.desktop_sound.test":
             _require_keys(message, {"type", "soundId"}, optional={"soundId"})
             sound_id = message.get("soundId")
@@ -204,6 +255,7 @@ def run_host(
                 output_stream,
                 {
                     "requestId": "",
+                    "protocolVersion": PROTOCOL_VERSION,
                     "response": _error(
                         "data",
                         "Die Native-Host-Anfrage war ungültig.",
@@ -220,6 +272,7 @@ def run_host(
                 output_stream,
                 {
                     "requestId": request_id,
+                    "protocolVersion": PROTOCOL_VERSION,
                     "response": _error("broker", "Ungültige Native-Host-Anfrage."),
                 },
             )
@@ -238,7 +291,11 @@ def run_host(
             resolved_logger.info("native_host_success operation=%s", operation)
         write_native_message(
             output_stream,
-            {"requestId": request_id, "response": response},
+            {
+                "requestId": request_id,
+                "protocolVersion": PROTOCOL_VERSION,
+                "response": response,
+            },
         )
 
 
@@ -311,6 +368,17 @@ def _payload(message: Mapping[str, Any]) -> Mapping[str, Any]:
     return payload
 
 
+def _backup_import_payload(message: Mapping[str, Any]) -> Mapping[str, Any]:
+    payload = _payload(message)
+    format_version = payload.get("format_version")
+    if not isinstance(format_version, int):
+        raise ValueError("Ungültige API-Broker-Anfrage.")
+    for list_field in ("templates", "notification_targets", "searches"):
+        if list_field in payload and not isinstance(payload[list_field], list):
+            raise ValueError("Ungültige API-Broker-Anfrage.")
+    return payload
+
+
 def _template_payload(message: Mapping[str, Any], allow_partial: bool) -> Mapping[str, Any]:
     payload = _payload(message)
     if not set(payload) <= {"name", "body"}:
@@ -333,6 +401,63 @@ def _settings_payload(message: Mapping[str, Any]) -> Mapping[str, Any]:
     if enabled is not None and not isinstance(enabled, bool):
         raise ValueError("Ungültige API-Broker-Anfrage.")
     if sound_id is not None and not _is_sound_id(sound_id):
+        raise ValueError("Ungültige API-Broker-Anfrage.")
+    return payload
+
+
+_GLOBAL_NOTIFICATION_SETTINGS_FIELDS: dict[str, type | tuple[type, ...]] = {
+    "ntfy_timeout_seconds": (int, float),
+    "discord_timeout_seconds": (int, float),
+    "email_smtp_host": str,
+    "email_smtp_port": int,
+    "email_smtp_username": str,
+    "email_smtp_password": str,
+    "email_from_address": str,
+    "email_encryption": str,
+    "email_timeout_seconds": (int, float),
+}
+
+_NOTIFICATION_TARGET_FIELDS: dict[str, type | tuple[type, ...]] = {
+    "type": str,
+    "name": str,
+    "enabled": bool,
+    "base_url": str,
+    "topic": str,
+    "token": str,
+    "webhook_url": str,
+    "email_address": str,
+}
+
+
+def _validate_typed_payload(
+    payload: Any, fields: dict[str, type | tuple[type, ...]], *, allow_empty: bool = False
+) -> None:
+    if not isinstance(payload, dict) or (not payload and not allow_empty):
+        raise ValueError("Ungültige API-Broker-Anfrage.")
+    if not set(payload) <= set(fields):
+        raise ValueError("Ungültige API-Broker-Anfrage.")
+    for key, value in payload.items():
+        expected = fields[key]
+        if key == "enabled":
+            if not isinstance(value, bool):
+                raise ValueError("Ungültige API-Broker-Anfrage.")
+            continue
+        if not isinstance(value, expected) or isinstance(value, bool):
+            raise ValueError("Ungültige API-Broker-Anfrage.")
+
+
+def _global_notifications_settings_payload(message: Mapping[str, Any]) -> Mapping[str, Any]:
+    payload = _payload(message)
+    _validate_typed_payload(payload, _GLOBAL_NOTIFICATION_SETTINGS_FIELDS)
+    return payload
+
+
+def _notification_target_payload(
+    message: Mapping[str, Any], *, allow_partial: bool = False
+) -> Mapping[str, Any]:
+    payload = _payload(message)
+    _validate_typed_payload(payload, _NOTIFICATION_TARGET_FIELDS, allow_empty=allow_partial)
+    if not allow_partial and not {"type", "name"} <= set(payload):
         raise ValueError("Ungültige API-Broker-Anfrage.")
     return payload
 

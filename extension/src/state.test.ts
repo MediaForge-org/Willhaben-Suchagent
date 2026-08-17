@@ -18,6 +18,7 @@ test("agent state is online when every local endpoint responds", async () => {
     recentListings: vi.fn(async () => [listing]),
     templates: vi.fn(async () => [template]),
     marketplaceOptions: vi.fn(async () => ({ categories: [], locations: [] })),
+    notificationTargets: vi.fn(async () => []),
   } as unknown as ApiService;
   const result = await loadAgentSnapshot(api);
   expect(result.online).toBe(true);
@@ -32,6 +33,7 @@ test("status success and listings failure remains online", async () => {
     recentListings: vi.fn(async () => { throw new Error("Listings unavailable"); }),
     templates: vi.fn(async () => [template]),
     marketplaceOptions: vi.fn(async () => ({ categories: [], locations: [] })),
+    notificationTargets: vi.fn(async () => []),
   } as unknown as ApiService;
   const result = await loadAgentSnapshot(api);
   expect(result.online).toBe(true);
@@ -50,6 +52,7 @@ test("status success and templates failure remains online", async () => {
     recentListings: vi.fn(async () => [listing]),
     templates: vi.fn(async () => { throw new Error("Templates unavailable"); }),
     marketplaceOptions: vi.fn(async () => ({ categories: [], locations: [] })),
+    notificationTargets: vi.fn(async () => []),
   } as unknown as ApiService;
   const result = await loadAgentSnapshot(api);
   expect(result.online).toBe(true);
@@ -68,6 +71,7 @@ test("unreachable status endpoint reports the agent offline", async () => {
     recentListings: vi.fn(),
     templates: vi.fn(),
     marketplaceOptions: vi.fn(),
+    notificationTargets: vi.fn(),
   } as unknown as ApiService;
   const result = await loadAgentSnapshot(api);
   expect(result).toEqual({
@@ -102,6 +106,7 @@ test("HTTP error from status endpoint is reachable but partially unavailable", a
     recentListings: vi.fn(async () => [listing]),
     templates: vi.fn(async () => [template]),
     marketplaceOptions: vi.fn(async () => ({ categories: [], locations: [] })),
+    notificationTargets: vi.fn(async () => []),
   } as unknown as ApiService;
 
   const result = await loadAgentSnapshot(api);
@@ -121,6 +126,7 @@ test("data error from status endpoint is reachable but partially unavailable", a
     recentListings: vi.fn(async () => [listing]),
     templates: vi.fn(async () => [template]),
     marketplaceOptions: vi.fn(async () => ({ categories: [], locations: [] })),
+    notificationTargets: vi.fn(async () => []),
   } as unknown as ApiService;
 
   const result = await loadAgentSnapshot(api);

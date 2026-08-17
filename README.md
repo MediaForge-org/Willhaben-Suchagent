@@ -3,13 +3,22 @@
 Willhaben-Suchagent ist ein lokal betriebener Live-Suchagent für öffentlich sichtbare
 Marktplatz-Inserate auf willhaben.at. Mehrere aktivierte Suchen teilen sich genau einen
 globalen Scheduler. Er startet standardmäßig alle 60 Sekunden einen Cycle, begrenzt die
-Provider-Abfragen zentral und sendet global deduplizierte neue Treffer per ntfy aufs Handy.
+Provider-Abfragen zentral und sendet global deduplizierte neue Treffer über wiederverwendbare
+ntfy-/Discord-/E-Mail-Ziele.
 
-Der aktuelle Stand ist **Meilenstein M4 (Firefox-Extension + Nachrichten-Templates)**.
-Es werden weder Willhaben-Login noch Accounts, Benutzer-Cookies, CAPTCHA-Umgehung,
-Proxy-/IP-Rotation oder aggressive Retries verwendet. Auto & Motor, Immobilien, Jobs,
-automatische Nachrichten sind ausdrücklich nicht implementiert. Templates bereiten nur Text
-vor; der Benutzer kopiert und versendet ihn selbst.
+Dieses README richtet sich an Entwickler und Beitragende. Für die reine Installation und
+Nutzung als Endbenutzer siehe [USER_GUIDE.md](USER_GUIDE.md); Änderungen je Version stehen in
+[CHANGELOG.md](CHANGELOG.md), die manuelle Release-Abnahme in
+[RELEASE_TEST_CHECKLIST.md](RELEASE_TEST_CHECKLIST.md).
+
+Der aktuelle Stand ist **Meilenstein M7 (finaler V1.0.0-Release-Meilenstein)** — Marktplatz-
+Suchen mit tiefen Kategoriepfaden und Willhaben-Suchlink-Import, wiederverwendbare
+Benachrichtigungsziele, Backup/Restore, sowie portable, python-freie Windows-/Linux-
+Release-Pakete. Es werden weder Willhaben-Login noch Accounts, Benutzer-Cookies,
+CAPTCHA-Umgehung, Proxy-/IP-Rotation oder aggressive Retries verwendet. Auto & Motor,
+Immobilien, Jobs und automatische Verkäufernachrichten sind für V1.0 ausdrücklich nicht
+implementiert. Templates bereiten nur Text vor; der Benutzer kopiert und versendet ihn
+selbst.
 
 ## Funktionsumfang
 
@@ -209,6 +218,54 @@ python -m pip install --upgrade pip
 python -m pip install -e '.[dev]'
 cp .env.example .env
 ```
+
+## Produktion: Installation für Endbenutzer (Windows/Linux)
+
+Für die tägliche Nutzung ist kein Terminal-, Python-, pip- oder npm-Wissen nötig.
+Firefox bleibt die einzige Bedienoberfläche.
+
+Diese Sektion beschreibt den Start **aus dem Quellcode-Checkout** (für Entwickler bzw.
+`make`/CI-Umgebungen). Für Endbenutzer gibt es zusätzlich fertig gebaute, portable
+Release-Pakete (Windows/Linux), die **kein Python, pip, venv oder Node** mehr benötigen —
+siehe [USER_GUIDE.md](USER_GUIDE.md). Diese Pakete werden mit
+`deployment/build-release-linux.sh` (auf Linux) bzw. `deployment/build-release-windows.ps1`
+(auf Windows) reproduzierbar erzeugt; kein Cross-Compiling zwischen den Plattformen. Die
+gebündelte Python-Laufzeit wird mit PyInstaller erstellt (`deployment/pyinstaller/`), die
+Firefox-Erweiterung dabei bereits fertig gebaut mitgeliefert (`extension/dist` bzw. als
+`.xpi`).
+
+- **Linux:** `Einrichtung.sh` einmalig ausführen (erstellt automatisch eine lokale
+  `.venv`, installiert ausschließlich Laufzeit-Abhängigkeiten, richtet Firefox
+  Native Messaging und einen `systemd --user`-Dienst mit Autostart ein). Danach
+  läuft der Agent dauerhaft im Hintergrund — auch bei geschlossenem Firefox und
+  nach einem Neustart. Manueller Start ohne Autostart: `Willhaben-Suchagent
+  starten.sh`.
+- **Windows:** `Einrichtung.bat` einmalig ausführen (erstellt die lokale `.venv`,
+  installiert Laufzeit-Abhängigkeiten, registriert Firefox Native Messaging über
+  `HKEY_CURRENT_USER`, keine Administratorrechte nötig). Danach den Agenten über
+  `Willhaben-Suchagent starten.bat` starten; dieses Fenster bleibt während der
+  Nutzung offen (kein systemd-Äquivalent unter Windows in V1.0).
+
+Der komplette Programmordner darf an einen beliebigen Ort verschoben werden
+(auch auf ein anderes Laufwerk oder in einen Pfad mit Leerzeichen) — danach
+einmal die Einrichtung erneut ausführen, damit Native Messaging und der
+Autostart-Dienst auf den neuen Pfad zeigen. Persistente Daten (Datenbank,
+Konfiguration, Secrets) liegen in den Standard-Benutzerverzeichnissen des
+Betriebssystems (siehe unten) und werden dabei nicht verschoben oder verändert.
+
+### Lokaler Secret-Store
+
+Sensible Werte (ntfy-Token, Discord-Webhook, SMTP-Passwort) liegen niemals in
+SQLite oder im Repository, sondern in einer separaten Datei, die nur für den
+aktuellen Benutzer lesbar ist (`0600` unter Linux/macOS). Bestehende `.env`-Werte
+werden beim allerersten Start als Fallback übernommen und danach nicht mehr
+gelesen. Die API gibt Secrets nie im Klartext zurück, sondern nur `configured`-
+Flags bzw. maskierte Anzeigen.
+
+| Zweck | Linux | Windows |
+|---|---|---|
+| Konfiguration | `~/.config/willhaben-suchagent/` | `%APPDATA%\willhaben-suchagent\` |
+| Daten (Datenbank, Secrets) | `~/.local/share/willhaben-suchagent/` | `%LOCALAPPDATA%\willhaben-suchagent\` |
 
 ## Konfiguration
 

@@ -8,15 +8,25 @@ import {
 import {
   type ApiBrokerRequest,
   type ApiBrokerResponse,
+  EXPECTED_PROTOCOL_VERSION,
   isNativeResponseEnvelope,
   type NativeRequestEnvelope,
 } from "./broker-protocol";
 import type {
   AgentStatus,
   AgentSettings,
+  BackupDocument,
+  BackupImportSummary,
+  ChannelTestResult,
+  GlobalNotificationSettings,
+  GlobalNotificationSettingsPatch,
+  ImportedSearchDraft,
   Listing,
   MarketplaceOptions,
   MessageTemplate,
+  NotificationTarget,
+  NotificationTargetCreate,
+  NotificationTargetPatch,
   Search,
 } from "./types";
 
@@ -87,6 +97,39 @@ export class NativeApiClient implements ApiService {
       type: "api.desktop_sound.test",
       ...(soundId === undefined ? {} : { soundId }),
     });
+  updateNotificationSettings = (payload: GlobalNotificationSettingsPatch) =>
+    this.send<GlobalNotificationSettings>({
+      type: "api.settings.notifications.update",
+      payload: payload as Record<string, unknown>,
+    });
+  importSearchUrl = (url: string) =>
+    this.send<ImportedSearchDraft>({ type: "api.marketplace.import_search_url", url });
+  notificationTargets = () =>
+    this.send<NotificationTarget[]>({ type: "api.notificationTargets.list" });
+  createNotificationTarget = (payload: NotificationTargetCreate) =>
+    this.send<NotificationTarget>({
+      type: "api.notificationTargets.create",
+      payload: payload as unknown as Record<string, unknown>,
+    });
+  updateNotificationTarget = (id: number, payload: NotificationTargetPatch) =>
+    this.send<NotificationTarget>({
+      type: "api.notificationTargets.update",
+      id,
+      payload: payload as unknown as Record<string, unknown>,
+    });
+  deleteNotificationTarget = (id: number) =>
+    this.send<{ deleted: boolean; searches_affected: number }>({
+      type: "api.notificationTargets.delete",
+      id,
+    });
+  testNotificationTarget = (id: number) =>
+    this.send<ChannelTestResult>({ type: "api.notificationTargets.test", id });
+  exportBackup = () => this.send<BackupDocument>({ type: "api.backup.export" });
+  importBackup = (document: BackupDocument) =>
+    this.send<BackupImportSummary>({
+      type: "api.backup.import",
+      payload: document as unknown as Record<string, unknown>,
+    });
 
   disconnect(): void {
     this.port?.disconnect();
@@ -105,6 +148,8 @@ export class NativeApiClient implements ApiService {
         throw new ApiNativeHostError("not_installed", response.error.message);
       case "native_host_start":
         throw new ApiNativeHostError("not_startable", response.error.message);
+      case "native_host_outdated":
+        throw new ApiNativeHostError("outdated", response.error.message);
       case "data":
       case "broker":
         throw new ApiDataError(response.error.message);
@@ -147,6 +192,15 @@ export class NativeApiClient implements ApiService {
   private readonly handleMessage = (rawMessage: unknown): void => {
     if (!isNativeResponseEnvelope(rawMessage)) {
       this.failAll(new ApiDataError("Der Native Host lieferte eine ungültige Antwort."));
+      return;
+    }
+    if (rawMessage.protocolVersion !== EXPECTED_PROTOCOL_VERSION) {
+      this.failAll(
+        new ApiNativeHostError(
+          "outdated",
+          "Die lokale Verbindung muss aktualisiert werden. Bitte führe die Einrichtung erneut aus.",
+        ),
+      );
       return;
     }
     const request = this.pending.get(rawMessage.requestId);

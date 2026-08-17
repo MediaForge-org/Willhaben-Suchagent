@@ -4,6 +4,7 @@ import logging
 
 import httpx
 
+from agent.app._version import __version__
 from agent.app.core.exceptions import (
     AccessDeniedError,
     ChallengeDetectedError,
@@ -22,7 +23,9 @@ from agent.app.willhaben.marketplace_search import (
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_USER_AGENT = "Willhaben-Suchagent/0.3.1 (public Marketplace pages; no authentication)"
+DEFAULT_USER_AGENT = (
+    f"Willhaben-Suchagent/{__version__} (public Marketplace pages; no authentication)"
+)
 
 
 class WillhabenMarketplaceProvider(ListingProvider):

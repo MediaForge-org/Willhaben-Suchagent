@@ -20,15 +20,32 @@ export type ApiBrokerRequest =
     }
   | { type: "api.template.delete"; id: number }
   | { type: "api.template.render"; templateId: number; listingId: number }
-  | { type: "api.desktop_sound.test"; soundId?: string };
+  | { type: "api.desktop_sound.test"; soundId?: string }
+  | {
+      type: "api.settings.notifications.update";
+      payload: Record<string, unknown>;
+    }
+  | { type: "api.marketplace.import_search_url"; url: string }
+  | { type: "api.notificationTargets.list" }
+  | { type: "api.notificationTargets.create"; payload: Record<string, unknown> }
+  | { type: "api.notificationTargets.update"; id: number; payload: Record<string, unknown> }
+  | { type: "api.notificationTargets.delete"; id: number }
+  | { type: "api.notificationTargets.test"; id: number }
+  | { type: "api.backup.export" }
+  | { type: "api.backup.import"; payload: Record<string, unknown> };
 
 export interface NativeRequestEnvelope {
   requestId: string;
   request: ApiBrokerRequest;
 }
 
+/** Bumped in lockstep with `PROTOCOL_VERSION` in `agent/app/native_messaging/host.py`. */
+export const EXPECTED_PROTOCOL_VERSION = 1;
+
 export interface NativeResponseEnvelope {
   requestId: string;
+  /** Absent on a stale (pre-versioning) native host; treated as incompatible. */
+  protocolVersion?: number;
   response: ApiBrokerResponse;
 }
 
@@ -38,7 +55,8 @@ export type ApiBrokerErrorKind =
   | "data"
   | "broker"
   | "native_host_missing"
-  | "native_host_start";
+  | "native_host_start"
+  | "native_host_outdated";
 
 export type ApiBrokerResponse<T = unknown> =
   | { ok: true; data: T }
@@ -64,7 +82,39 @@ export function isApiBrokerRequest(value: unknown): value is ApiBrokerRequest {
     case "api.searches.list":
     case "api.templates.list":
     case "api.marketplace.options":
+    case "api.notificationTargets.list":
+    case "api.backup.export":
       return hasOnlyKeys(value, ["type"]);
+    case "api.backup.import":
+      return (
+        hasOnlyKeys(value, ["type", "payload"]) &&
+        isRecord(value.payload) &&
+        typeof value.payload.format_version === "number"
+      );
+    case "api.settings.notifications.update":
+      return (
+        hasOnlyKeys(value, ["type", "payload"]) &&
+        isRecord(value.payload) &&
+        Object.keys(value.payload).length > 0
+      );
+    case "api.notificationTargets.create":
+      return hasOnlyKeys(value, ["type", "payload"]) && isRecord(value.payload);
+    case "api.notificationTargets.update":
+      return (
+        hasOnlyKeys(value, ["type", "id", "payload"]) &&
+        isPositiveInteger(value.id) &&
+        isRecord(value.payload)
+      );
+    case "api.notificationTargets.delete":
+    case "api.notificationTargets.test":
+      return hasOnlyKeys(value, ["type", "id"]) && isPositiveInteger(value.id);
+    case "api.marketplace.import_search_url":
+      return (
+        hasOnlyKeys(value, ["type", "url"]) &&
+        typeof value.url === "string" &&
+        value.url.length > 0 &&
+        value.url.length <= 2000
+      );
     case "api.desktop_sound.test":
       return (
         hasOnlyKeys(value, ["type", "soundId"]) &&
@@ -116,9 +166,11 @@ export function isApiBrokerRequest(value: unknown): value is ApiBrokerRequest {
 export function isNativeResponseEnvelope(value: unknown): value is NativeResponseEnvelope {
   return (
     isRecord(value) &&
-    hasOnlyKeys(value, ["requestId", "response"]) &&
+    hasOnlyKeys(value, ["requestId", "protocolVersion", "response"]) &&
     typeof value.requestId === "string" &&
     value.requestId.length > 0 &&
+    (value.protocolVersion === undefined ||
+      (typeof value.protocolVersion === "number" && Number.isInteger(value.protocolVersion))) &&
     isApiBrokerResponse(value.response)
   );
 }
@@ -137,6 +189,7 @@ export function isApiBrokerResponse(value: unknown): value is ApiBrokerResponse 
       "broker",
       "native_host_missing",
       "native_host_start",
+      "native_host_outdated",
     ].includes(String(value.error.kind)) && typeof value.error.message === "string";
   const validStatus =
     value.error.status === undefined ||

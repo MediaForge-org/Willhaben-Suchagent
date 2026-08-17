@@ -1,0 +1,96 @@
+name: Windows Release Build
+
+# Builds and smoke-tests the Windows x86_64 release package on a real,
+# GitHub-hosted Windows runner (no cross-compiling from Linux). Scope is
+# strictly this repository: the Python/FastAPI agent + the TypeScript
+# Firefox extension. Never publishes a GitHub Release or a tag — artifacts
+# are uploaded for manual download/review only.
+
+"on":
+  workflow_dispatch: {}
+  push:
+    paths:
+      - "agent/**"
+      - "extension/**"
+      - "deployment/**"
+      - "pyproject.toml"
+
+permissions:
+  contents: read
+
+jobs:
+  windows-release:
+    name: Build and smoke-test Windows release
+    runs-on: windows-2025
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up Node (extension build only)
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install Python build dependencies
+        run: python -m pip install -e ".[build]"
+
+      - name: Install extension dependencies
+        working-directory: extension
+        run: npm ci
+
+      - name: Extension typecheck
+        working-directory: extension
+        run: npm run typecheck
+
+      - name: Extension tests
+        working-directory: extension
+        run: npm test -- --run
+
+      - name: Extension build
+        working-directory: extension
+        run: npm run build
+
+      - name: Build Windows release package
+        shell: pwsh
+        run: ./deployment/build-release-windows.ps1
+
+      - name: Locate release package
+        id: locate
+        shell: pwsh
+        run: |
+          $stageDir = Get-ChildItem -Path "dist-release" -Directory |
+            Where-Object { $_.Name -like "Willhaben-Suchagent-*-windows-x86_64" } |
+            Select-Object -First 1
+          if (-not $stageDir) { throw "Release stage directory not found under dist-release/" }
+          "stage_dir=$($stageDir.FullName)" >> $env:GITHUB_OUTPUT
+
+      - name: Windows release smoke tests
+        shell: pwsh
+        run: >
+          ./deployment/ci/windows-smoke-test.ps1
+          -StageDir "${{ steps.locate.outputs.stage_dir }}"
+          -LogPath "windows-smoke-test.log"
+
+      - name: Upload Windows release package
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: willhaben-suchagent-windows-release
+          path: |
+            dist-release/*.zip
+            dist-release/SHA256SUMS.windows
+            dist-release/*.xpi
+          if-no-files-found: warn
+
+      - name: Upload smoke test log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-smoke-test-log
+          path: windows-smoke-test.log
+          if-no-files-found: warn

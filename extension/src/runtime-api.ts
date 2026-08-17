@@ -12,9 +12,18 @@ import {
 import type {
   AgentStatus,
   AgentSettings,
+  BackupDocument,
+  BackupImportSummary,
+  ChannelTestResult,
+  GlobalNotificationSettings,
+  GlobalNotificationSettingsPatch,
+  ImportedSearchDraft,
   Listing,
   MarketplaceOptions,
   MessageTemplate,
+  NotificationTarget,
+  NotificationTargetCreate,
+  NotificationTargetPatch,
   Search,
 } from "./types";
 
@@ -60,6 +69,39 @@ export class RuntimeApiClient implements ApiService {
       type: "api.desktop_sound.test",
       ...(soundId === undefined ? {} : { soundId }),
     });
+  updateNotificationSettings = (payload: GlobalNotificationSettingsPatch) =>
+    this.send<GlobalNotificationSettings>({
+      type: "api.settings.notifications.update",
+      payload: payload as Record<string, unknown>,
+    });
+  importSearchUrl = (url: string) =>
+    this.send<ImportedSearchDraft>({ type: "api.marketplace.import_search_url", url });
+  notificationTargets = () =>
+    this.send<NotificationTarget[]>({ type: "api.notificationTargets.list" });
+  createNotificationTarget = (payload: NotificationTargetCreate) =>
+    this.send<NotificationTarget>({
+      type: "api.notificationTargets.create",
+      payload: payload as unknown as Record<string, unknown>,
+    });
+  updateNotificationTarget = (id: number, payload: NotificationTargetPatch) =>
+    this.send<NotificationTarget>({
+      type: "api.notificationTargets.update",
+      id,
+      payload: payload as unknown as Record<string, unknown>,
+    });
+  deleteNotificationTarget = (id: number) =>
+    this.send<{ deleted: boolean; searches_affected: number }>({
+      type: "api.notificationTargets.delete",
+      id,
+    });
+  testNotificationTarget = (id: number) =>
+    this.send<ChannelTestResult>({ type: "api.notificationTargets.test", id });
+  exportBackup = () => this.send<BackupDocument>({ type: "api.backup.export" });
+  importBackup = (document: BackupDocument) =>
+    this.send<BackupImportSummary>({
+      type: "api.backup.import",
+      payload: document as unknown as Record<string, unknown>,
+    });
 
   private async send<T>(message: ApiBrokerRequest): Promise<T> {
     let rawResponse: unknown;
@@ -84,6 +126,8 @@ export class RuntimeApiClient implements ApiService {
         throw new ApiNativeHostError("not_installed", rawResponse.error.message);
       case "native_host_start":
         throw new ApiNativeHostError("not_startable", rawResponse.error.message);
+      case "native_host_outdated":
+        throw new ApiNativeHostError("outdated", rawResponse.error.message);
     }
   }
 }

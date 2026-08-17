@@ -1,6 +1,13 @@
 import { RuntimeApiClient } from "./runtime-api";
 import { loadAgentSnapshot } from "./state";
-import type { AgentSnapshot, Listing, MessageTemplate, Search } from "./types";
+import type {
+  AgentSnapshot,
+  Listing,
+  MessageTemplate,
+  NotificationTarget,
+  NotificationTargetType,
+  Search,
+} from "./types";
 import {
   copyPreparedMessage,
   chooseDefaultTemplate,
@@ -18,8 +25,30 @@ const banner = document.querySelector<HTMLElement>("#connection-banner")!;
 const modalRoot = document.querySelector<HTMLElement>("#modal-root")!;
 let snapshot: AgentSnapshot | null = null;
 let connectionFailure:
-  | { reason: "agent_unreachable" | "native_host_missing" | "native_host_start"; message: string }
+  | {
+      reason:
+        | "agent_unreachable"
+        | "native_host_missing"
+        | "native_host_start"
+        | "native_host_outdated";
+      message: string;
+    }
   | null = null;
+
+// Tracks which view is currently built in #content, so periodic status polling
+// can tell "still on the same view" (skip rebuilding forms) apart from an actual
+// navigation (safe, and expected, to rebuild from fresh data).
+let renderedView: View | null = null;
+
+// Dirty flag for the inline SMTP sender form. Set the moment the user edits a
+// field; only a successful save (or leaving+re-entering the view) clears it.
+// Periodic status polling must never rebuild a dirty form. Per-target editing
+// happens in a modal (separate DOM root), so it never needs this protection.
+let smtpFormDirty = false;
+
+function anySettingsDirty(): boolean {
+  return smtpFormDirty;
+}
 
 type View = "overview" | "searches" | "listings" | "templates" | "settings";
 
@@ -48,7 +77,7 @@ function activateNavigation(view: View): void {
   });
 }
 
-async function refresh(showLoading = true): Promise<void> {
+async function refresh(showLoading = true, periodic = false): Promise<void> {
   if (showLoading) content.replaceChildren(element("div", "loading", "Daten werden geladen …"));
   const connection = await loadAgentSnapshot(api);
   if (!connection.online) {
@@ -67,10 +96,10 @@ async function refresh(showLoading = true): Promise<void> {
         "Agent erreichbar. Einzelne Bereiche konnten nicht geladen werden; neuer Versuch in 30 Sekunden.";
     }
   }
-  renderView();
+  renderView(periodic);
 }
 
-function renderView(): void {
+function renderView(periodic = false): void {
   const view = currentView();
   activateNavigation(view);
   if (!snapshot) {
@@ -79,14 +108,17 @@ function renderView(): void {
     const offline = element("section", "offline-panel");
     const nativeHostMissing = connectionFailure?.reason === "native_host_missing";
     const nativeHostStart = connectionFailure?.reason === "native_host_start";
+    const nativeHostOutdated = connectionFailure?.reason === "native_host_outdated";
     offline.append(
       element("div", "offline-icon", "!"),
       element(
         "h1",
         "",
-        nativeHostMissing || nativeHostStart
-          ? "Lokale Verbindung fehlt"
-          : "Agent nicht erreichbar",
+        nativeHostOutdated
+          ? "Lokale Verbindung veraltet"
+          : nativeHostMissing || nativeHostStart
+            ? "Lokale Verbindung fehlt"
+            : "Agent nicht erreichbar",
       ),
       element(
         "p",
@@ -97,6 +129,7 @@ function renderView(): void {
       retry,
     );
     content.replaceChildren(offline);
+    renderedView = null;
     return;
   }
   const renderers: Record<View, () => void> = {
@@ -106,8 +139,20 @@ function renderView(): void {
     templates: renderTemplates,
     settings: renderSettings,
   };
-  renderers[view]();
-  content.focus({ preventScroll: true });
+  const changedView = view !== renderedView;
+  if (view === "settings" && !changedView && periodic) {
+    // A periodic status poll landed while the user is still on the settings
+    // view: never rebuild it here, that would wipe unsaved input, focus, and
+    // cursor position. Settings only (re)load on an actual navigation into
+    // the view or an explicit, user-triggered refresh.
+  } else {
+    if (view === "settings" && changedView) {
+      smtpFormDirty = false;
+    }
+    renderers[view]();
+    if (changedView) content.focus({ preventScroll: true });
+  }
+  renderedView = view;
 }
 
 function renderOverview(): void {
@@ -137,6 +182,11 @@ function renderOverview(): void {
   const latest = data.listings.slice(0, 3);
   recent.append(latest.length ? listingGrid(latest, false) : element("p", "empty-state", "Noch keine Inserate gefunden."));
   fragment.append(recent);
+  if (data.status) {
+    fragment.append(
+      element("p", "app-version-footer", `Willhaben-Suchagent v${data.status.app_version}`),
+    );
+  }
   content.replaceChildren(fragment);
 }
 
@@ -231,113 +281,499 @@ function renderTemplates(): void {
   );
 }
 
-function renderSettings(): void {
-  const safety = element("section", "card settings-card");
+const TARGET_TYPE_INFO: Record<
+  NotificationTargetType,
+  { heading: string; typeLabel: string; addLabel: string; empty: string }
+> = {
+  ntfy: {
+    heading: "Push / ntfy",
+    typeLabel: "Push-Ziel",
+    addLabel: "+ Push-Ziel",
+    empty: "Noch kein Push-Ziel eingerichtet.",
+  },
+  discord: {
+    heading: "Discord",
+    typeLabel: "Discord-Ziel",
+    addLabel: "+ Discord-Ziel",
+    empty: "Noch kein Discord-Ziel eingerichtet.",
+  },
+  email: {
+    heading: "E-Mail",
+    typeLabel: "E-Mail-Empfänger",
+    addLabel: "+ E-Mail-Empfänger",
+    empty: "Noch kein E-Mail-Empfänger eingerichtet.",
+  },
+};
+
+function targetStatusBadge(target: NotificationTarget): HTMLElement {
+  if (!target.configured) return element("span", "badge muted", "nicht eingerichtet");
+  return element(
+    "span",
+    `badge ${target.enabled ? "success" : "muted"}`,
+    target.enabled ? "aktiv" : "eingerichtet, aus",
+  );
+}
+
+async function refreshTargetsInSnapshot(): Promise<void> {
+  snapshot!.notificationTargets = await api.notificationTargets();
+}
+
+async function refreshTargetsCard(type: NotificationTargetType): Promise<void> {
+  await refreshTargetsInSnapshot();
+  const current = document.querySelector<HTMLElement>(`[data-target-card="${type}"]`);
+  if (current) current.replaceWith(renderTargetsCard(type));
+}
+
+function renderTargetsCard(type: NotificationTargetType): HTMLElement {
+  const info = TARGET_TYPE_INFO[type];
+  const card = element("section", "card settings-card notification-targets-card");
+  card.dataset.targetCard = type;
+  card.append(element("h2", "", info.heading));
+  const targets = snapshot!.notificationTargets.filter((target) => target.type === type);
+  const list = element("div", "target-list");
+  if (!targets.length) {
+    list.append(element("p", "empty-state", info.empty));
+  } else {
+    for (const target of targets) {
+      list.append(renderTargetRow(type, target));
+    }
+  }
+  const addButton = element("button", "button primary", info.addLabel);
+  addButton.type = "button";
+  addButton.addEventListener("click", () => openTargetEditor(type));
+  card.append(list, addButton);
+  return card;
+}
+
+function renderTargetRow(type: NotificationTargetType, target: NotificationTarget): HTMLElement {
+  const row = element("div", "target-row");
+  const nameLine = element("div", "target-row-name");
+  nameLine.append(element("strong", "", target.name), targetStatusBadge(target));
+  row.append(nameLine);
+  if (type === "email" && target.email_address_masked) {
+    row.append(element("p", "subtle", target.email_address_masked));
+  }
+  const result = element("p", "subtle target-row-result");
+  const actions = element("div", "actions");
+  const editButton = element("button", "button secondary", "Bearbeiten");
+  editButton.type = "button";
+  editButton.addEventListener("click", () => openTargetEditor(type, target));
+  const testButton = element("button", "button secondary", "Testen");
+  testButton.type = "button";
+  testButton.addEventListener("click", async () => {
+    testButton.disabled = true;
+    result.textContent = "Test wird gesendet …";
+    try {
+      const response = await api.testNotificationTarget(target.id);
+      result.textContent = `✓ ${response.message}`;
+    } catch (error) {
+      result.textContent = `✕ ${error instanceof Error ? error.message : "Test fehlgeschlagen."}`;
+    } finally {
+      testButton.disabled = false;
+    }
+  });
+  const deleteButton = element("button", "button secondary", "Löschen");
+  deleteButton.type = "button";
+  deleteButton.addEventListener("click", async () => {
+    const usageNote =
+      target.usage_count > 0
+        ? `Dieses Ziel wird von ${target.usage_count} Suche${target.usage_count === 1 ? "" : "n"} verwendet. `
+        : "";
+    if (!confirm(`${usageNote}„${target.name}“ wirklich löschen?`)) return;
+    try {
+      await api.deleteNotificationTarget(target.id);
+      await refreshTargetsCard(type);
+    } catch (error) {
+      alert(error instanceof Error ? error.message : "Ziel konnte nicht gelöscht werden.");
+    }
+  });
+  actions.append(editButton, testButton, deleteButton);
+  row.append(actions, result);
+  return row;
+}
+
+function openTargetEditor(type: NotificationTargetType, target?: NotificationTarget): void {
+  const typeLabel = TARGET_TYPE_INFO[type].typeLabel;
+  const { body, close } = modal(target ? `${typeLabel} bearbeiten` : `Neues ${typeLabel}`);
+  const form = element("form", "form-grid");
+  const name = input("name", target?.name ?? "");
+  const enabled = input("enabled", "", "checkbox");
+  enabled.checked = target?.enabled ?? true;
+  form.append(field("Name", name));
+
+  let baseUrl: HTMLInputElement | null = null;
+  let topic: HTMLInputElement | null = null;
+  let token: HTMLInputElement | null = null;
+  let webhook: HTMLInputElement | null = null;
+  let emailAddress: HTMLInputElement | null = null;
+
+  if (type === "ntfy") {
+    baseUrl = input("base_url", target?.ntfy_base_url ?? "https://ntfy.sh");
+    topic = input("topic", "");
+    topic.placeholder = target?.ntfy_topic_configured
+      ? "•••••••••••••••• (gespeichert, leer lassen zum Behalten)"
+      : "z. B. mein-privates-topic";
+    token = input("token", "", "password");
+    token.placeholder = target?.ntfy_token_configured
+      ? "•••••••••••••••• (gespeichert, leer lassen zum Behalten)"
+      : "Optionaler Zugriffs-Token";
+    form.append(field("Server", baseUrl), field("Topic", topic), field("Token (optional)", token));
+  } else if (type === "discord") {
+    webhook = input("webhook_url", "", "password");
+    webhook.placeholder = target?.discord_webhook_configured
+      ? "•••••••••••••••• (gespeichert, leer lassen zum Behalten)"
+      : "https://discord.com/api/webhooks/…";
+    form.append(field("Webhook-URL", webhook));
+  } else {
+    emailAddress = input("email_address", target?.email_address ?? "");
+    form.append(field("E-Mail-Adresse", emailAddress));
+  }
+  form.append(field("Aktiv", enabled));
+
+  const error = element("p", "form-error");
+  const actions = element("div", "actions form-actions");
+  const cancel = element("button", "button secondary", "Abbrechen");
+  cancel.type = "button";
+  cancel.addEventListener("click", close);
+  const submit = element("button", "button primary", target ? "Änderungen speichern" : "Ziel erstellen");
+  submit.type = "submit";
+  actions.append(cancel, submit);
+  form.append(error, actions);
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (!name.value.trim()) {
+      error.textContent = "Bitte gib einen Namen an.";
+      return;
+    }
+    const payload: Record<string, unknown> = { name: name.value.trim(), enabled: enabled.checked };
+    if (type === "ntfy") {
+      payload.base_url = baseUrl!.value.trim() || "https://ntfy.sh";
+      if (topic!.value.trim()) payload.topic = topic!.value.trim();
+      if (token!.value.trim()) payload.token = token!.value.trim();
+      if (!target && !topic!.value.trim()) {
+        error.textContent = "Bitte gib ein ntfy-Topic an.";
+        return;
+      }
+    } else if (type === "discord") {
+      if (webhook!.value.trim()) payload.webhook_url = webhook!.value.trim();
+      if (!target && !webhook!.value.trim()) {
+        error.textContent = "Bitte gib eine Discord-Webhook-URL an.";
+        return;
+      }
+    } else {
+      payload.email_address = emailAddress!.value.trim();
+      if (!payload.email_address) {
+        error.textContent = "Bitte gib eine E-Mail-Adresse an.";
+        return;
+      }
+    }
+    submit.disabled = true;
+    try {
+      if (target) {
+        await api.updateNotificationTarget(target.id, payload);
+      } else {
+        await api.createNotificationTarget({ type, ...payload } as never);
+      }
+      close();
+      await refreshTargetsCard(type);
+    } catch (caught) {
+      error.textContent =
+        caught instanceof Error ? caught.message : "Das Ziel konnte nicht gespeichert werden.";
+      submit.disabled = false;
+    }
+  });
+  body.append(form);
+  name.focus();
+}
+
+function renderSmtpSenderSection(): HTMLElement {
+  const settings = snapshot!.settings?.notifications ?? null;
+  const card = element("section", "card settings-card");
+  card.dataset.smtpCard = "true";
+  card.append(
+    element("h2", "", "E-Mail-Versand (SMTP)"),
+    element("p", "", "Gilt gemeinsam für alle E-Mail-Empfänger."),
+  );
+  if (!settings) {
+    card.append(element("p", "subtle", "Einstellungen sind derzeit nicht verfügbar."));
+    return card;
+  }
+  const form = element("form", "form-grid");
+  const smtpHost = input("email_smtp_host", settings.email_smtp_host ?? "");
+  const smtpPort = input("email_smtp_port", String(settings.email_smtp_port), "number");
+  const smtpUsername = input("email_smtp_username", settings.email_smtp_username ?? "");
+  const smtpPassword = input("email_smtp_password", "", "password");
+  smtpPassword.placeholder = settings.email_smtp_password_configured
+    ? "•••••••••••••••• (gespeichert, leer lassen zum Behalten)"
+    : "SMTP-Passwort";
+  const fromAddress = input("email_from_address", settings.email_from_address ?? "");
+  const encryption = select(
+    "email_encryption",
+    [
+      { label: "STARTTLS", value: "starttls" },
+      { label: "SSL/TLS", value: "ssl" },
+      { label: "Keine Verschlüsselung", value: "none" },
+    ],
+    settings.email_encryption,
+  );
+  form.append(
+    field("SMTP-Server", smtpHost),
+    field("SMTP-Port", smtpPort),
+    field("Benutzername", smtpUsername),
+    field("Passwort", smtpPassword),
+    field("Absenderadresse", fromAddress),
+    field("Verschlüsselung", encryption),
+  );
+  const dirtyIndicator = element("p", "dirty-indicator", "Ungespeicherte Änderungen");
+  dirtyIndicator.hidden = true;
+  const result = element("p", "subtle");
+  const actions = element("div", "actions");
+  const save = element("button", "button primary", "Speichern");
+  save.type = "submit";
+  actions.append(save);
+  form.append(dirtyIndicator, result, actions);
+  const markDirty = () => {
+    smtpFormDirty = true;
+    dirtyIndicator.hidden = false;
+  };
+  form.addEventListener("input", markDirty);
+  form.addEventListener("change", markDirty);
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const payload: Record<string, unknown> = {
+      email_smtp_host: smtpHost.value.trim() || null,
+      email_smtp_port: Number(smtpPort.value) || 587,
+      email_smtp_username: smtpUsername.value.trim() || null,
+      email_from_address: fromAddress.value.trim() || null,
+      email_encryption: encryption.value,
+    };
+    if (smtpPassword.value.trim()) payload.email_smtp_password = smtpPassword.value.trim();
+    save.disabled = true;
+    result.textContent = "Wird gespeichert …";
+    try {
+      const updated = await api.updateNotificationSettings(payload);
+      if (snapshot!.settings) snapshot!.settings.notifications = updated;
+      smtpFormDirty = false;
+      const current = document.querySelector<HTMLElement>('[data-smtp-card="true"]');
+      if (current) current.replaceWith(renderSmtpSenderSection());
+    } catch (error) {
+      result.textContent =
+        error instanceof Error ? error.message : "Einstellung konnte nicht gespeichert werden.";
+      save.disabled = false;
+    }
+  });
+  card.append(form);
+  return card;
+}
+
+function renderNotificationSettings(): HTMLElement {
+  const section = element("section", "notification-settings");
+  section.append(
+    element("h2", "", "Benachrichtigungen"),
+    element("p", "", "Wiederverwendbare Push-, Discord- und E-Mail-Ziele einrichten und testen."),
+  );
+  const grid = element("div", "notification-channel-grid");
+  grid.append(
+    renderTargetsCard("ntfy"),
+    renderTargetsCard("discord"),
+    renderTargetsCard("email"),
+  );
+  section.append(grid, renderSmtpSenderSection());
+  return section;
+}
+
+function renderDesktopSoundSection(): HTMLElement {
   const soundStatus = snapshot!.status;
   const soundSettings = snapshot!.settings;
+  const section = element("div", "desktop-sound-section");
+  section.append(element("h2", "", "Desktop-Sound"));
+  if (!soundSettings) {
+    section.append(element("p", "subtle", "Soundeinstellungen sind derzeit nicht verfügbar."));
+    return section;
+  }
+  const controls = element("div", "sound-settings");
+  const enabled = input("desktop_sound_enabled", "", "checkbox");
+  enabled.checked = soundSettings.desktop_sound_enabled;
+  const enabledLabel = field("Sound EIN/AUS", enabled);
+  const badge = element(
+    "span",
+    `badge ${enabled.checked ? "success" : "muted"}`,
+    enabled.checked ? "EIN" : "AUS",
+  );
+  enabledLabel.append(badge);
+  const soundSelect = select(
+    "desktop_sound_id",
+    soundSettings.desktop_sounds.map((sound) => ({
+      label: sound.name,
+      value: sound.id,
+    })),
+    soundSettings.desktop_sound_id,
+  );
+  const testSound = element("button", "button secondary", "Ton testen");
+  testSound.type = "button";
+  const result = element("p", "subtle");
+  const persist = async (payload: {
+    desktop_sound_enabled?: boolean;
+    desktop_sound_id?: string;
+  }) => {
+    enabled.disabled = true;
+    soundSelect.disabled = true;
+    testSound.disabled = true;
+    result.textContent = "Einstellung wird gespeichert …";
+    try {
+      snapshot!.settings = await api.updateSettings(payload);
+      if (snapshot!.status) {
+        snapshot!.status.desktop_sound_enabled = snapshot!.settings.desktop_sound_enabled;
+        snapshot!.status.desktop_sound_id = snapshot!.settings.desktop_sound_id;
+      }
+      section.replaceWith(renderDesktopSoundSection());
+    } catch (error) {
+      enabled.checked = snapshot!.settings!.desktop_sound_enabled;
+      soundSelect.value = snapshot!.settings!.desktop_sound_id;
+      result.textContent =
+        error instanceof Error ? error.message : "Einstellung konnte nicht gespeichert werden.";
+      enabled.disabled = false;
+      soundSelect.disabled = false;
+      testSound.disabled = false;
+    }
+  };
+  enabled.addEventListener("change", () => {
+    void persist({ desktop_sound_enabled: enabled.checked });
+  });
+  soundSelect.addEventListener("change", () => {
+    void persist({ desktop_sound_id: soundSelect.value });
+  });
+  testSound.addEventListener("click", async () => {
+    testSound.disabled = true;
+    result.textContent = "Sound wird abgespielt …";
+    try {
+      const response = await previewDesktopSound(api, soundSelect.value);
+      result.textContent = response.message;
+    } catch (error) {
+      result.textContent =
+        error instanceof Error ? error.message : "Soundtest ist fehlgeschlagen.";
+    } finally {
+      testSound.disabled = false;
+    }
+  });
+  controls.append(enabledLabel, field("Benachrichtigungston", soundSelect), testSound, result);
+  section.append(
+    controls,
+    element(
+      "p",
+      "subtle",
+      !soundSettings.desktop_sound_enabled
+        ? "Desktop-Sound ist ausgeschaltet; Ton testen bleibt als manuelle Vorschau möglich."
+        : soundStatus?.desktop_sound_available
+          ? "Bei neuen Inseraten spielt der Agent maximal einmal pro Cycle den gewählten Ton."
+          : soundStatus?.desktop_sound_disabled_reason ??
+              "Die Audio-Ausgabe ist derzeit nicht verfügbar.",
+    ),
+  );
+  return section;
+}
+
+function readFileAsText(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result ?? ""));
+    reader.onerror = () => reject(new Error("Die Datei konnte nicht gelesen werden."));
+    reader.readAsText(file);
+  });
+}
+
+function renderBackupSection(): HTMLElement {
+  const section = element("section", "card backup-section");
+  section.append(
+    element("h2", "", "Daten"),
+    element(
+      "p",
+      "subtle",
+      "Passwörter, Tokens und Discord-Webhooks werden aus Sicherheitsgründen nicht exportiert.",
+    ),
+  );
+  const actions = element("div", "backup-actions");
+  const exportButton = element("button", "button secondary", "Backup exportieren");
+  exportButton.type = "button";
+  const importButton = element("button", "button secondary", "Backup importieren");
+  importButton.type = "button";
+  const fileInput = document.createElement("input");
+  fileInput.type = "file";
+  fileInput.accept = "application/json";
+  fileInput.hidden = true;
+  const statusLine = element("p", "subtle backup-status");
+
+  exportButton.addEventListener("click", () => {
+    void (async () => {
+      exportButton.disabled = true;
+      statusLine.textContent = "Backup wird erstellt …";
+      try {
+        const backup = await api.exportBackup();
+        const blob = new Blob([JSON.stringify(backup, null, 2)], {
+          type: "application/json",
+        });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement("a");
+        link.href = url;
+        link.download = `willhaben-suchagent-backup-${new Date().toISOString().slice(0, 10)}.json`;
+        link.click();
+        URL.revokeObjectURL(url);
+        statusLine.textContent = "Backup wurde heruntergeladen.";
+      } catch (error) {
+        statusLine.textContent =
+          error instanceof Error ? error.message : "Export ist fehlgeschlagen.";
+      } finally {
+        exportButton.disabled = false;
+      }
+    })();
+  });
+
+  importButton.addEventListener("click", () => fileInput.click());
+  fileInput.addEventListener("change", () => {
+    void (async () => {
+      const file = fileInput.files?.[0];
+      fileInput.value = "";
+      if (!file) return;
+      statusLine.textContent = "Backup wird importiert …";
+      try {
+        const text = await readFileAsText(file);
+        const parsed = JSON.parse(text);
+        const summary = await api.importBackup(parsed);
+        statusLine.textContent =
+          `Import abgeschlossen: ${summary.searches_created} Suche(n), ` +
+          `${summary.notification_targets_created} Ziel(e), ${summary.templates_created} Vorlage(n) neu angelegt ` +
+          `(${summary.searches_skipped + summary.notification_targets_skipped + summary.templates_skipped} bereits vorhanden, übersprungen). ` +
+          "Passwörter, Tokens und Discord-Webhooks müssen für importierte Ziele erneut eingerichtet werden. " +
+          "Neu geladen erscheinen sie beim nächsten Seitenwechsel.";
+      } catch (error) {
+        statusLine.textContent =
+          error instanceof Error ? error.message : "Backup konnte nicht importiert werden.";
+      }
+    })();
+  });
+
+  actions.append(exportButton, importButton, fileInput);
+  section.append(actions, statusLine);
+  return section;
+}
+
+function renderSettings(): void {
+  const safety = element("section", "card settings-card");
   safety.append(
     element("h2", "", "Lokaler Agent"),
     element("p", "", "Verbindung über Firefox Native Messaging"),
     element("code", "api-address", "at.willhaben_suchagent.bridge"),
     element("p", "subtle", "Die Extension spricht ausschließlich mit der installierten lokalen Bridge. Sie benötigt weder Willhaben-Login noch Cookies oder Passwörter."),
-    element("h2", "", "Desktop-Sound"),
-  );
-  if (!soundSettings) {
-    safety.append(
-      element("p", "subtle", "Soundeinstellungen sind derzeit nicht verfügbar."),
-    );
-  } else {
-    const controls = element("div", "sound-settings");
-    const enabled = input("desktop_sound_enabled", "", "checkbox");
-    enabled.checked = soundSettings.desktop_sound_enabled;
-    const enabledLabel = field("Sound EIN/AUS", enabled);
-    const badge = element(
-      "span",
-      `badge ${enabled.checked ? "success" : "muted"}`,
-      enabled.checked ? "EIN" : "AUS",
-    );
-    enabledLabel.append(badge);
-    const soundSelect = select(
-      "desktop_sound_id",
-      soundSettings.desktop_sounds.map((sound) => ({
-        label: sound.name,
-        value: sound.id,
-      })),
-      soundSettings.desktop_sound_id,
-    );
-    const testSound = element("button", "button secondary", "Ton testen");
-    testSound.type = "button";
-    const result = element("p", "subtle");
-    const persist = async (payload: {
-      desktop_sound_enabled?: boolean;
-      desktop_sound_id?: string;
-    }) => {
-      enabled.disabled = true;
-      soundSelect.disabled = true;
-      testSound.disabled = true;
-      result.textContent = "Einstellung wird gespeichert …";
-      try {
-        snapshot!.settings = await api.updateSettings(payload);
-        if (snapshot!.status) {
-          snapshot!.status.desktop_sound_enabled =
-            snapshot!.settings.desktop_sound_enabled;
-          snapshot!.status.desktop_sound_id = snapshot!.settings.desktop_sound_id;
-        }
-        renderSettings();
-      } catch (error) {
-        enabled.checked = snapshot!.settings!.desktop_sound_enabled;
-        soundSelect.value = snapshot!.settings!.desktop_sound_id;
-        result.textContent =
-          error instanceof Error ? error.message : "Einstellung konnte nicht gespeichert werden.";
-        enabled.disabled = false;
-        soundSelect.disabled = false;
-        testSound.disabled = false;
-      }
-    };
-    enabled.addEventListener("change", () => {
-      void persist({ desktop_sound_enabled: enabled.checked });
-    });
-    soundSelect.addEventListener("change", () => {
-      void persist({ desktop_sound_id: soundSelect.value });
-    });
-    testSound.addEventListener("click", async () => {
-      testSound.disabled = true;
-      result.textContent = "Sound wird abgespielt …";
-      try {
-        const response = await previewDesktopSound(api, soundSelect.value);
-        result.textContent = response.message;
-      } catch (error) {
-        result.textContent =
-          error instanceof Error ? error.message : "Soundtest ist fehlgeschlagen.";
-      } finally {
-        testSound.disabled = false;
-      }
-    });
-    controls.append(
-      enabledLabel,
-      field("Benachrichtigungston", soundSelect),
-      testSound,
-      result,
-    );
-    safety.append(
-      controls,
-      element(
-        "p",
-        "subtle",
-        !soundSettings.desktop_sound_enabled
-          ? "Desktop-Sound ist ausgeschaltet; Ton testen bleibt als manuelle Vorschau möglich."
-          : soundStatus?.desktop_sound_available
-            ? "Bei neuen Inseraten spielt der Agent maximal einmal pro Cycle den gewählten Ton."
-            : soundStatus?.desktop_sound_disabled_reason ??
-                "Die Audio-Ausgabe ist derzeit nicht verfügbar.",
-      ),
-    );
-  }
-  safety.append(
+    renderDesktopSoundSection(),
     element("h2", "", "Nachrichten bleiben manuell"),
     element("p", "", "Die Extension rendert Text im Agenten, kopiert ihn auf Wunsch und öffnet das Inserat. Sie füllt kein Willhaben-Formular aus und klickt niemals auf Senden."),
   );
-  content.replaceChildren(pageHeader("Einstellungen", "Verbindung und Sicherheitsprinzipien."), safety);
+  content.replaceChildren(
+    pageHeader("Einstellungen", "Verbindung und Sicherheitsprinzipien."),
+    renderNotificationSettings(),
+    renderBackupSection(),
+    safety,
+  );
 }
 
 function modal(title: string): { dialog: HTMLElement; body: HTMLElement; close: () => void } {
@@ -387,11 +823,180 @@ function select(name: string, options: Array<{ label: string; value: string }>, 
   return node;
 }
 
+const CHANNEL_TOGGLE_GROUPS: Array<{ type: NotificationTargetType; label: string; setupHint: string }> = [
+  { type: "ntfy", label: "Handy-Push", setupHint: "Noch kein Push-Ziel eingerichtet." },
+  { type: "discord", label: "Discord", setupHint: "Noch kein Discord-Ziel eingerichtet." },
+  { type: "email", label: "E-Mail", setupHint: "Noch kein E-Mail-Empfänger eingerichtet." },
+];
+
+// New searches start with no target pre-selected: the user must explicitly choose
+// which of their existing targets this search should notify. Simpler and safer than
+// guessing a "sensible default", and it matches how targets can be shared/renamed
+// freely across searches without a search silently gaining a new recipient.
+function channelTogglesField(search?: Search): HTMLElement {
+  const wrapper = element("div", "channel-toggles");
+  wrapper.append(element("span", "field-legend", "Benachrichtigungen für diese Suche"));
+  const targets = snapshot!.notificationTargets;
+  const selectedIds = new Set(search?.notification_target_ids ?? []);
+  for (const group of CHANNEL_TOGGLE_GROUPS) {
+    const groupTargets = targets.filter((target) => target.type === group.type);
+    const groupWrapper = element("div", "channel-toggle-group");
+    groupWrapper.append(element("span", "field-legend", group.label));
+    if (!groupTargets.length) {
+      groupWrapper.append(element("p", "subtle", group.setupHint));
+      const hint = element("a", "text-link channel-setup-hint", "Jetzt einrichten");
+      hint.href = "#settings";
+      groupWrapper.append(hint);
+    } else {
+      for (const target of groupTargets) {
+        const toggle = input(`notification_target_${target.id}`, "", "checkbox");
+        toggle.checked = selectedIds.has(target.id);
+        const line = element("label", "channel-toggle-row");
+        line.append(toggle, element("span", "", target.name), targetStatusBadge(target));
+        groupWrapper.append(line);
+      }
+    }
+    wrapper.append(groupWrapper);
+  }
+  const soundGroup = element("div", "channel-toggle-group");
+  soundGroup.append(element("span", "field-legend", "Desktop-Sound"));
+  const soundToggle = input("notify_desktop_sound", "", "checkbox");
+  soundToggle.checked = search?.notify_desktop_sound ?? true;
+  const soundLine = element("label", "channel-toggle-row");
+  soundLine.append(soundToggle, element("span", "", "Ton bei neuem Inserat abspielen"));
+  soundGroup.append(soundLine);
+  wrapper.append(soundGroup);
+  return wrapper;
+}
+
+function addCategoryOption(select: HTMLSelectElement, value: string, label: string): void {
+  const existing = Array.from(select.options).find((option) => option.value === value);
+  if (existing) {
+    select.value = value;
+    return;
+  }
+  const option = element("option", "", label);
+  option.value = value;
+  select.append(option);
+  select.value = value;
+}
+
+function buildImportUrlSection(fields: {
+  query: HTMLInputElement;
+  priceMin: HTMLInputElement;
+  priceMax: HTMLInputElement;
+  location: HTMLSelectElement;
+  category: HTMLSelectElement;
+}): HTMLElement {
+  const section = element("section", "import-url-section");
+  const toggle = element("button", "button secondary", "Willhaben-Suchlink übernehmen");
+  toggle.type = "button";
+  const panel = element("div", "import-url-panel");
+  panel.hidden = true;
+  toggle.addEventListener("click", () => {
+    panel.hidden = !panel.hidden;
+  });
+
+  const urlInput = input("import_url", "", "url");
+  urlInput.placeholder = "https://www.willhaben.at/iad/kaufen-und-verkaufen/marktplatz/…";
+  const analyze = element("button", "button secondary", "Link analysieren");
+  analyze.type = "button";
+  const importError = element("p", "form-error");
+  const preview = element("div", "import-preview");
+  preview.hidden = true;
+
+  analyze.addEventListener("click", async () => {
+    importError.textContent = "";
+    preview.hidden = true;
+    preview.replaceChildren();
+    const url = urlInput.value.trim();
+    if (!url) {
+      importError.textContent = "Bitte füge zuerst einen Willhaben-Suchlink ein.";
+      return;
+    }
+    analyze.disabled = true;
+    try {
+      const draft = await api.importSearchUrl(url);
+      const rows: Array<[string, string]> = [
+        ["Kategorie", draft.category_label ?? "beliebig"],
+        ["Suchbegriff", draft.query || "beliebig"],
+        [
+          "Preis",
+          draft.price_min || draft.price_max
+            ? `${draft.price_min ?? "0"} – ${draft.price_max ?? "beliebig"} €`
+            : "beliebig",
+        ],
+        ["Region", draft.location ?? "Österreich"],
+        ["Sortierung", "Neueste zuerst"],
+      ];
+      const list = element("dl", "import-preview-list");
+      for (const [label, value] of rows) {
+        list.append(element("dt", "", label), element("dd", "", value));
+      }
+      preview.append(element("h3", "", "Importierte Suche"), list);
+      if (draft.unsupported_filters.length) {
+        const warning = element("div", "import-warning");
+        warning.append(
+          element(
+            "p",
+            "",
+            "Ein Filter dieser Willhaben-Suche wird derzeit noch nicht unterstützt:",
+          ),
+        );
+        const items = element("ul");
+        for (const message of draft.unsupported_filters) items.append(element("li", "", message));
+        warning.append(items);
+        preview.append(warning);
+      }
+      const apply = element("button", "button primary", "Übernehmen");
+      apply.type = "button";
+      apply.addEventListener("click", () => {
+        fields.query.value = draft.query;
+        fields.priceMin.value = draft.price_min ?? "";
+        fields.priceMax.value = draft.price_max ?? "";
+        fields.location.value = draft.location ?? "";
+        if (draft.category_path) {
+          addCategoryOption(
+            fields.category,
+            draft.category_path,
+            draft.category_label ?? draft.category_path,
+          );
+        } else {
+          fields.category.value = "";
+        }
+        panel.hidden = true;
+      });
+      preview.append(apply);
+      preview.hidden = false;
+    } catch (caught) {
+      importError.textContent =
+        caught instanceof Error ? caught.message : "Der Willhaben-Link konnte nicht analysiert werden.";
+    } finally {
+      analyze.disabled = false;
+    }
+  });
+
+  panel.append(field("Willhaben-Suchlink", urlInput), analyze, importError, preview);
+  section.append(toggle, panel);
+  return section;
+}
+
 function openSearchEditor(search?: Search): void {
   const { body, close } = modal(search ? "Suche bearbeiten" : "Neue Marketplace-Suche");
   const form = element("form", "form-grid");
-  const categoryValue = String(search?.category_filters.marketplace_category ?? "");
-  const categoryOptions = [{ label: "Alle unterstützten Marketplace-Kategorien", value: "" }, ...snapshot!.options.categories];
+  const existingCategoryPath = String(search?.category_filters.marketplace_category ?? "");
+  const existingCategoryLabel = String(search?.category_filters.marketplace_category_label ?? "");
+  const knownCategoryValues = new Set(snapshot!.options.categories.map((option) => option.value));
+  const categoryOptions = [
+    { label: "Alle unterstützten Marketplace-Kategorien", value: "" },
+    ...snapshot!.options.categories,
+  ];
+  if (existingCategoryPath && !knownCategoryValues.has(existingCategoryPath)) {
+    categoryOptions.push({
+      label: existingCategoryLabel || existingCategoryPath,
+      value: existingCategoryPath,
+    });
+  }
   const locationOptions = [{ label: "Ganz Österreich", value: "" }, ...snapshot!.options.locations];
   const templateOptions = [
     { label: "Kein Standard-Template", value: "" },
@@ -399,16 +1004,33 @@ function openSearchEditor(search?: Search): void {
   ];
   const enabled = input("enabled", "", "checkbox");
   enabled.checked = search?.enabled ?? true;
+  const queryInput = input("query", search?.query ?? "");
+  const priceMinInput = input("price_min", search?.price_min ?? "", "number");
+  const priceMaxInput = input("price_max", search?.price_max ?? "", "number");
+  const locationSelect = select("location", locationOptions, search?.location ?? "");
+  const categorySelect = select("marketplace_category", categoryOptions, existingCategoryPath);
+  if (!search) {
+    form.append(
+      buildImportUrlSection({
+        query: queryInput,
+        priceMin: priceMinInput,
+        priceMax: priceMaxInput,
+        location: locationSelect,
+        category: categorySelect,
+      }),
+    );
+  }
   form.append(
     field("Name der Suche", input("name", search?.name ?? "")),
-    field("Suchbegriff", input("query", search?.query ?? "")),
-    field("Preis von (€)", input("price_min", search?.price_min ?? "", "number")),
-    field("Preis bis (€)", input("price_max", search?.price_max ?? "", "number")),
-    field("Region / Standort", select("location", locationOptions, search?.location ?? "")),
-    field("Kategorie", select("marketplace_category", categoryOptions, categoryValue)),
+    field("Suchbegriff (optional bei konkreter Kategorie)", queryInput),
+    field("Preis von (€)", priceMinInput),
+    field("Preis bis (€)", priceMaxInput),
+    field("Region / Standort", locationSelect),
+    field("Kategorie", categorySelect),
     field("Standard-Template", select("default_template_id", templateOptions, search?.default_template_id ? String(search.default_template_id) : "")),
     field("Live-Überwachung aktiv", enabled),
   );
+  form.append(channelTogglesField(search));
   const error = element("p", "form-error");
   const actions = element("div", "actions form-actions");
   const cancel = element("button", "button secondary", "Abbrechen");
@@ -425,11 +1047,15 @@ function openSearchEditor(search?: Search): void {
     const query = String(data.get("query") ?? "").trim();
     const priceMin = String(data.get("price_min") ?? "");
     const priceMax = String(data.get("price_max") ?? "");
-    if (!name) { error.textContent = "Bitte gib der Suche einen verständlichen Namen."; return; }
-    if (!query) { error.textContent = "Bitte gib einen Suchbegriff ein."; return; }
-    if (priceMin && priceMax && Number(priceMin) > Number(priceMax)) { error.textContent = "Der Mindestpreis darf nicht über dem Höchstpreis liegen."; return; }
     const category = String(data.get("marketplace_category") ?? "");
+    if (!name) { error.textContent = "Bitte gib der Suche einen verständlichen Namen."; return; }
+    if (!query && !category) { error.textContent = "Bitte gib einen Suchbegriff oder eine konkrete Kategorie an."; return; }
+    if (priceMin && priceMax && Number(priceMin) > Number(priceMax)) { error.textContent = "Der Mindestpreis darf nicht über dem Höchstpreis liegen."; return; }
     const templateId = String(data.get("default_template_id") ?? "");
+    const categoryLabel = categorySelect.selectedOptions[0]?.textContent ?? "";
+    const notificationTargetIds = snapshot!.notificationTargets
+      .filter((target) => data.get(`notification_target_${target.id}`) !== null)
+      .map((target) => target.id);
     const payload = {
       name,
       category: "marketplace",
@@ -437,9 +1063,13 @@ function openSearchEditor(search?: Search): void {
       price_min: priceMin || null,
       price_max: priceMax || null,
       location: String(data.get("location") ?? "") || null,
-      category_filters: category ? { marketplace_category: category } : {},
+      category_filters: category
+        ? { marketplace_category: category, marketplace_category_label: categoryLabel }
+        : {},
       enabled: enabled.checked,
       default_template_id: templateId ? Number(templateId) : null,
+      notification_target_ids: notificationTargetIds,
+      notify_desktop_sound: data.get("notify_desktop_sound") !== null,
     };
     submit.disabled = true;
     try {
@@ -567,7 +1197,26 @@ async function mutate(action: () => Promise<unknown>): Promise<void> {
   }
 }
 
-window.addEventListener("hashchange", renderView);
+let suppressNextHashchange = false;
+
+window.addEventListener("hashchange", () => {
+  if (suppressNextHashchange) {
+    suppressNextHashchange = false;
+    return;
+  }
+  const view = currentView();
+  if (renderedView === "settings" && view !== "settings" && anySettingsDirty()) {
+    const proceed = confirm(
+      "Es gibt ungespeicherte Änderungen bei den Benachrichtigungseinstellungen. Trotzdem verlassen?",
+    );
+    if (!proceed) {
+      suppressNextHashchange = true;
+      location.hash = "settings";
+      return;
+    }
+  }
+  renderView();
+});
 window.addEventListener("keydown", (event) => { if (event.key === "Escape") modalRoot.replaceChildren(); });
 void refresh();
-window.setInterval(() => void refresh(false), 30_000);
+window.setInterval(() => void refresh(false, true), 30_000);

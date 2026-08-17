@@ -85,6 +85,12 @@ test("all UI API capabilities map to fixed broker operations", async () => {
   await api.deleteTemplate(3);
   await api.renderTemplate(3, 9);
   await api.testDesktopSound("ping");
+  await api.updateNotificationSettings({ ntfy_timeout_seconds: 15 });
+  await api.notificationTargets();
+  await api.createNotificationTarget({ type: "ntfy", name: "Maxim iPhone" });
+  await api.updateNotificationTarget(4, { enabled: false });
+  await api.deleteNotificationTarget(4);
+  await api.testNotificationTarget(4);
 
   expect(sendMessage.mock.calls.map(([message]) => message)).toEqual([
     { type: "api.searches.list" },
@@ -104,5 +110,17 @@ test("all UI API capabilities map to fixed broker operations", async () => {
     { type: "api.template.delete", id: 3 },
     { type: "api.template.render", templateId: 3, listingId: 9 },
     { type: "api.desktop_sound.test", soundId: "ping" },
+    {
+      type: "api.settings.notifications.update",
+      payload: { ntfy_timeout_seconds: 15 },
+    },
+    { type: "api.notificationTargets.list" },
+    {
+      type: "api.notificationTargets.create",
+      payload: { type: "ntfy", name: "Maxim iPhone" },
+    },
+    { type: "api.notificationTargets.update", id: 4, payload: { enabled: false } },
+    { type: "api.notificationTargets.delete", id: 4 },
+    { type: "api.notificationTargets.test", id: 4 },
   ]);
 });

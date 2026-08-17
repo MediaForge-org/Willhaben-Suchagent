@@ -6,10 +6,11 @@ import {
   ApiNativeHostError,
   ApiTransportError,
 } from "./api-contract";
-import type {
-  ApiBrokerResponse,
-  NativeRequestEnvelope,
-  NativeResponseEnvelope,
+import {
+  EXPECTED_PROTOCOL_VERSION,
+  type ApiBrokerResponse,
+  type NativeRequestEnvelope,
+  type NativeResponseEnvelope,
 } from "./broker-protocol";
 import {
   NativeApiClient,
@@ -45,10 +46,14 @@ class FakeNativePort implements NativePort {
     this.messages.push(message);
   }
 
-  respond(index: number, response: ApiBrokerResponse): void {
+  respond(
+    index: number,
+    response: ApiBrokerResponse,
+    protocolVersion: number = EXPECTED_PROTOCOL_VERSION,
+  ): void {
     const requestId = this.messages[index]?.requestId;
     if (!requestId) throw new Error("Missing test request");
-    const envelope: NativeResponseEnvelope = { requestId, response };
+    const envelope: NativeResponseEnvelope = { requestId, protocolVersion, response };
     this.onMessage.emit(envelope);
   }
 
@@ -154,6 +159,29 @@ test("native client distinguishes missing host, agent, HTTP and data failures", 
   await expect(invalid).rejects.toBeInstanceOf(ApiDataError);
 });
 
+test("native client rejects responses from a stale native host with a clear error", async () => {
+  const port = new FakeNativePort();
+  const api = new NativeApiClient(connector(port));
+
+  const outdated = api.status();
+  port.respond(0, { ok: true, data: { scheduler_running: true } }, EXPECTED_PROTOCOL_VERSION - 1);
+  await expect(outdated).rejects.toMatchObject({
+    reason: "outdated",
+  } satisfies Partial<ApiNativeHostError>);
+
+  const missingVersionPort = new FakeNativePort();
+  const legacyApi = new NativeApiClient(connector(missingVersionPort));
+  const legacy = legacyApi.status();
+  const requestId = missingVersionPort.messages[0]?.requestId;
+  missingVersionPort.onMessage.emit({
+    requestId,
+    response: { ok: true, data: { scheduler_running: true } },
+  });
+  await expect(legacy).rejects.toMatchObject({
+    reason: "outdated",
+  } satisfies Partial<ApiNativeHostError>);
+});
+
 test("all background capabilities keep fixed broker operations", async () => {
   const port = new FakeNativePort();
   const api = new NativeApiClient(connector(port));
@@ -171,6 +199,12 @@ test("all background capabilities keep fixed broker operations", async () => {
     api.deleteTemplate(3),
     api.renderTemplate(3, 9),
     api.testDesktopSound("ping"),
+    api.updateNotificationSettings({ ntfy_timeout_seconds: 15 }),
+    api.notificationTargets(),
+    api.createNotificationTarget({ type: "ntfy", name: "Maxim iPhone" }),
+    api.updateNotificationTarget(4, { enabled: false }),
+    api.deleteNotificationTarget(4),
+    api.testNotificationTarget(4),
   ];
   for (let index = 0; index < calls.length; index += 1) {
     port.respond(index, { ok: true, data: null });
@@ -191,5 +225,11 @@ test("all background capabilities keep fixed broker operations", async () => {
     "api.template.delete",
     "api.template.render",
     "api.desktop_sound.test",
+    "api.settings.notifications.update",
+    "api.notificationTargets.list",
+    "api.notificationTargets.create",
+    "api.notificationTargets.update",
+    "api.notificationTargets.delete",
+    "api.notificationTargets.test",
   ]);
 });

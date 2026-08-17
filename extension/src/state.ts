@@ -8,13 +8,18 @@ import type {
   AgentSettings,
   AgentSnapshot,
   MarketplaceOptions,
+  NotificationTarget,
 } from "./types";
 
 export type AgentConnection =
   | { online: true; data: AgentSnapshot }
   | {
       online: false;
-      reason: "agent_unreachable" | "native_host_missing" | "native_host_start";
+      reason:
+        | "agent_unreachable"
+        | "native_host_missing"
+        | "native_host_start"
+        | "native_host_outdated";
       message: string;
     };
 
@@ -30,7 +35,9 @@ export async function loadAgentSnapshot(api: ApiService): Promise<AgentConnectio
         reason:
           error.reason === "not_installed"
             ? "native_host_missing"
-            : "native_host_start",
+            : error.reason === "outdated"
+              ? "native_host_outdated"
+              : "native_host_start",
         message: error.message,
       };
     }
@@ -44,14 +51,21 @@ export async function loadAgentSnapshot(api: ApiService): Promise<AgentConnectio
     endpointErrors.status = errorMessage(error);
   }
 
-  const [searchesResult, listingsResult, templatesResult, optionsResult, settingsResult] =
-    await Promise.allSettled([
-      api.searches(),
-      api.recentListings(),
-      api.templates(),
-      api.marketplaceOptions(),
-      api.settings(),
-    ]);
+  const [
+    searchesResult,
+    listingsResult,
+    templatesResult,
+    optionsResult,
+    settingsResult,
+    notificationTargetsResult,
+  ] = await Promise.allSettled([
+    api.searches(),
+    api.recentListings(),
+    api.templates(),
+    api.marketplaceOptions(),
+    api.settings(),
+    api.notificationTargets(),
+  ]);
   const searches = settledValue(searchesResult, [], "searches", endpointErrors);
   const listings = settledValue(listingsResult, [], "listings", endpointErrors);
   const templates = settledValue(templatesResult, [], "templates", endpointErrors);
@@ -67,6 +81,12 @@ export async function loadAgentSnapshot(api: ApiService): Promise<AgentConnectio
     "settings",
     endpointErrors,
   );
+  const notificationTargets = settledValue<NotificationTarget[]>(
+    notificationTargetsResult,
+    [],
+    "notificationTargets",
+    endpointErrors,
+  );
   return {
     online: true,
     data: {
@@ -76,6 +96,7 @@ export async function loadAgentSnapshot(api: ApiService): Promise<AgentConnectio
       templates,
       options,
       settings,
+      notificationTargets,
       endpointErrors,
     },
   };

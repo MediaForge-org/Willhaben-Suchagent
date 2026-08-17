@@ -47,7 +47,12 @@ export async function handleApiBrokerRequest(
       return brokerError("http", error.message, error.status);
     }
     if (error instanceof ApiNativeHostError) {
-      const kind = error.reason === "not_installed" ? "native_host_missing" : "native_host_start";
+      const kind =
+        error.reason === "not_installed"
+          ? "native_host_missing"
+          : error.reason === "outdated"
+            ? "native_host_outdated"
+            : "native_host_start";
       logger.error(`api_broker_native_host_error operation=${operation} reason=${error.reason}`);
       return brokerError(kind, error.message);
     }
@@ -92,6 +97,28 @@ async function dispatch(request: ApiBrokerRequest, api: ApiService): Promise<unk
       return api.renderTemplate(request.templateId, request.listingId);
     case "api.desktop_sound.test":
       return api.testDesktopSound(request.soundId);
+    case "api.settings.notifications.update":
+      return api.updateNotificationSettings(request.payload);
+    case "api.marketplace.import_search_url":
+      return api.importSearchUrl(request.url);
+    case "api.notificationTargets.list":
+      return api.notificationTargets();
+    case "api.notificationTargets.create":
+      return api.createNotificationTarget(
+        request.payload as unknown as Parameters<ApiService["createNotificationTarget"]>[0],
+      );
+    case "api.notificationTargets.update":
+      return api.updateNotificationTarget(request.id, request.payload);
+    case "api.notificationTargets.delete":
+      return api.deleteNotificationTarget(request.id);
+    case "api.notificationTargets.test":
+      return api.testNotificationTarget(request.id);
+    case "api.backup.export":
+      return api.exportBackup();
+    case "api.backup.import":
+      return api.importBackup(
+        request.payload as unknown as Parameters<ApiService["importBackup"]>[0],
+      );
   }
 }
 
@@ -102,7 +129,8 @@ function brokerError(
     | "data"
     | "broker"
     | "native_host_missing"
-    | "native_host_start",
+    | "native_host_start"
+    | "native_host_outdated",
   message: string,
   status?: number,
 ): ApiBrokerResponse {

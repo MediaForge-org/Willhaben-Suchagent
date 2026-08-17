@@ -3,7 +3,8 @@ import smtplib
 from abc import ABC, abstractmethod
 from decimal import Decimal
 from email.message import EmailMessage
-from urllib.parse import quote
+from typing import Literal
+from urllib.parse import quote, urlsplit
 
 import httpx
 
@@ -18,9 +19,16 @@ class NotificationDisabledError(Exception):
     """Notification delivery was requested while the transport is disabled."""
 
 
+class InvalidChannelConfigurationError(ValueError):
+    """A user-supplied channel configuration failed validation before saving."""
+
+
 class NotificationService(ABC):
     enabled: bool = True
     disabled_reason: str | None = None
+    # Whether the channel has enough non-secret+secret data to ever work, independent
+    # of the `enabled` toggle. Drives the extension's "eingerichtet" vs "aktiv" UI.
+    configured: bool = False
 
     @abstractmethod
     async def notify_new_listing(self, listing: Listing) -> None:
@@ -65,8 +73,28 @@ class NtfyNotificationService(NotificationService):
         timeout_seconds: float = 10,
         client: httpx.AsyncClient | None = None,
     ) -> None:
+        self._client = client or httpx.AsyncClient()
+        self._owns_client = client is None
+        self.configure(
+            enabled=enabled,
+            base_url=base_url,
+            topic=topic,
+            token=token,
+            timeout_seconds=timeout_seconds,
+        )
+
+    def configure(
+        self,
+        *,
+        enabled: bool,
+        base_url: str,
+        topic: str | None,
+        token: str | None = None,
+        timeout_seconds: float = 10,
+    ) -> None:
         normalized_topic = topic.strip() if topic else ""
-        self.enabled = bool(enabled and base_url.strip() and normalized_topic)
+        self.configured = bool(base_url.strip() and normalized_topic)
+        self.enabled = bool(enabled and self.configured)
         self.disabled_reason = None
         if not enabled:
             self.disabled_reason = "NTFY_ENABLED is false"
@@ -75,11 +103,10 @@ class NtfyNotificationService(NotificationService):
         elif not normalized_topic:
             self.disabled_reason = "NTFY_TOPIC is not configured"
 
+        self.base_url = base_url
         self._publish_url = f"{base_url.rstrip('/')}/{quote(normalized_topic, safe='')}"
         self._token = token
         self._timeout = httpx.Timeout(timeout_seconds)
-        self._client = client or httpx.AsyncClient()
-        self._owns_client = client is None
 
     async def notify_new_listing(self, listing: Listing) -> None:
         parts = [listing.article_label]
@@ -171,6 +198,13 @@ class DiscordNotificationService(NotificationService):
 
     TEST_MESSAGE = "Willhaben-Suchagent – Test erfolgreich"
 
+    _ALLOWED_WEBHOOK_HOSTS = (
+        "discord.com",
+        "discordapp.com",
+        "canary.discord.com",
+        "ptb.discord.com",
+    )
+
     def __init__(
         self,
         *,
@@ -179,8 +213,16 @@ class DiscordNotificationService(NotificationService):
         timeout_seconds: float = 10,
         client: httpx.AsyncClient | None = None,
     ) -> None:
+        self._client = client or httpx.AsyncClient()
+        self._owns_client = client is None
+        self.configure(enabled=enabled, webhook_url=webhook_url, timeout_seconds=timeout_seconds)
+
+    def configure(
+        self, *, enabled: bool, webhook_url: str | None, timeout_seconds: float = 10
+    ) -> None:
         normalized_url = webhook_url.strip() if webhook_url else ""
-        self.enabled = bool(enabled and normalized_url)
+        self.configured = bool(normalized_url)
+        self.enabled = bool(enabled and self.configured)
         self.disabled_reason = None
         if not enabled:
             self.disabled_reason = "DISCORD_ENABLED is false"
@@ -189,8 +231,23 @@ class DiscordNotificationService(NotificationService):
 
         self._webhook_url = normalized_url
         self._timeout = httpx.Timeout(timeout_seconds)
-        self._client = client or httpx.AsyncClient()
-        self._owns_client = client is None
+
+    @classmethod
+    def _is_well_formed_webhook_url(cls, webhook_url: str) -> bool:
+        parts = urlsplit(webhook_url)
+        if parts.scheme != "https" or parts.hostname not in cls._ALLOWED_WEBHOOK_HOSTS:
+            return False
+        segments = [segment for segment in parts.path.split("/") if segment]
+        return len(segments) >= 4 and segments[0] == "api" and segments[1] == "webhooks"
+
+    @classmethod
+    def validate_webhook_url(cls, webhook_url: str) -> None:
+        """Raise before persisting a user-supplied webhook URL that cannot be Discord's."""
+
+        if not cls._is_well_formed_webhook_url(webhook_url):
+            raise InvalidChannelConfigurationError(
+                "Das sieht nicht nach einer gültigen Discord-Webhook-URL aus."
+            )
 
     async def notify_new_listing(self, listing: Listing) -> None:
         lines = _listing_summary_lines(listing)
@@ -218,6 +275,10 @@ class DiscordNotificationService(NotificationService):
             await self._client.aclose()
 
 
+EmailEncryption = Literal["starttls", "ssl", "none"]
+_EMAIL_ENCRYPTIONS: tuple[EmailEncryption, ...] = ("starttls", "ssl", "none")
+
+
 class EmailNotificationService(NotificationService):
     """Publish listing notifications as plain-text e-mails via SMTP."""
 
@@ -233,13 +294,42 @@ class EmailNotificationService(NotificationService):
         password: str | None = None,
         from_address: str | None,
         to_address: str | None,
-        use_tls: bool = True,
+        use_tls: bool | None = None,
+        encryption: EmailEncryption | None = None,
+        timeout_seconds: float = 10,
+    ) -> None:
+        self.configure(
+            enabled=enabled,
+            smtp_host=smtp_host,
+            smtp_port=smtp_port,
+            username=username,
+            password=password,
+            from_address=from_address,
+            to_address=to_address,
+            use_tls=use_tls,
+            encryption=encryption,
+            timeout_seconds=timeout_seconds,
+        )
+
+    def configure(
+        self,
+        *,
+        enabled: bool,
+        smtp_host: str | None,
+        smtp_port: int = 587,
+        username: str | None = None,
+        password: str | None = None,
+        from_address: str | None,
+        to_address: str | None,
+        use_tls: bool | None = None,
+        encryption: EmailEncryption | None = None,
         timeout_seconds: float = 10,
     ) -> None:
         normalized_host = smtp_host.strip() if smtp_host else ""
         normalized_from = from_address.strip() if from_address else ""
         normalized_to = to_address.strip() if to_address else ""
-        self.enabled = bool(enabled and normalized_host and normalized_from and normalized_to)
+        self.configured = bool(normalized_host and normalized_from and normalized_to)
+        self.enabled = bool(enabled and self.configured)
         self.disabled_reason = None
         if not enabled:
             self.disabled_reason = "EMAIL_ENABLED is false"
@@ -250,14 +340,27 @@ class EmailNotificationService(NotificationService):
         elif not normalized_to:
             self.disabled_reason = "EMAIL_TO_ADDRESS is not configured"
 
+        if encryption is not None:
+            resolved_encryption: EmailEncryption = encryption
+        else:
+            resolved_encryption = "starttls" if (use_tls is None or use_tls) else "none"
+
         self._smtp_host = normalized_host
         self._smtp_port = smtp_port
         self._username = username
         self._password = password
         self._from_address = normalized_from
         self._to_address = normalized_to
-        self._use_tls = use_tls
+        self._encryption: EmailEncryption = resolved_encryption
         self._timeout_seconds = timeout_seconds
+
+    @property
+    def use_tls(self) -> bool:
+        return self._encryption == "starttls"
+
+    @property
+    def encryption(self) -> EmailEncryption:
+        return self._encryption
 
     async def notify_new_listing(self, listing: Listing) -> None:
         lines = _listing_summary_lines(listing)
@@ -278,11 +381,12 @@ class EmailNotificationService(NotificationService):
         try:
             await asyncio.to_thread(self._send_sync, message)
         except (OSError, smtplib.SMTPException) as error:
-            raise NotificationDeliveryError("SMTP request failed") from error
+            raise NotificationDeliveryError("SMTP-Anmeldung fehlgeschlagen.") from error
 
     def _send_sync(self, message: EmailMessage) -> None:
-        with smtplib.SMTP(self._smtp_host, self._smtp_port, timeout=self._timeout_seconds) as smtp:
-            if self._use_tls:
+        smtp_class = smtplib.SMTP_SSL if self._encryption == "ssl" else smtplib.SMTP
+        with smtp_class(self._smtp_host, self._smtp_port, timeout=self._timeout_seconds) as smtp:
+            if self._encryption == "starttls":
                 smtp.starttls()
             if self._username and self._password:
                 smtp.login(self._username, self._password)

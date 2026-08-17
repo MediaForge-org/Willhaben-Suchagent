@@ -8,7 +8,7 @@ import {
   ApiTransportError,
 } from "./api-contract";
 import { handleApiBrokerRequest, type BrokerLogger } from "./api-broker";
-import { settings } from "./test-fixtures";
+import { notificationSettings, notificationTargets, settings } from "./test-fixtures";
 
 const logger: BrokerLogger = { info: vi.fn(), error: vi.fn() };
 
@@ -29,6 +29,33 @@ function mockApi(): ApiService {
     deleteTemplate: vi.fn(async () => undefined),
     renderTemplate: vi.fn(async () => ({ rendered_text: "Hallo" })),
     testDesktopSound: vi.fn(async () => ({ status: "played", message: "Notify" })),
+    updateNotificationSettings: vi.fn(async (payload) => ({
+      ...notificationSettings,
+      ...payload,
+    }) as never),
+    importSearchUrl: vi.fn(async () => ({
+      category_path: "apple/iphone-13-mini-5009987",
+      category_label: "Apple → iPhone 13 Mini",
+      query: "iphone 13 mini",
+      location: null,
+      price_min: null,
+      price_max: null,
+      unsupported_filters: [],
+    })),
+    notificationTargets: vi.fn(async () => notificationTargets),
+    createNotificationTarget: vi.fn(async (payload) => ({ id: 9, ...payload }) as never),
+    updateNotificationTarget: vi.fn(async (id, payload) => ({ id, ...payload }) as never),
+    deleteNotificationTarget: vi.fn(async () => ({ deleted: true, searches_affected: 0 })),
+    testNotificationTarget: vi.fn(async () => ({ status: "sent", message: "Test erfolgreich" })),
+    exportBackup: vi.fn(async () => ({ format_version: 1 })),
+    importBackup: vi.fn(async () => ({
+      templates_created: 0,
+      templates_skipped: 0,
+      notification_targets_created: 0,
+      notification_targets_skipped: 0,
+      searches_created: 0,
+      searches_skipped: 0,
+    })),
   };
 }
 
@@ -108,6 +135,67 @@ test("background mediates persistent settings and the selected sound test", asyn
     desktop_sound_id: "ping",
   });
   expect(api.testDesktopSound).toHaveBeenCalledExactlyOnceWith("ping");
+});
+
+test("background mediates global notification settings updates", async () => {
+  const api = mockApi();
+
+  await handleApiBrokerRequest(
+    {
+      type: "api.settings.notifications.update",
+      payload: { ntfy_timeout_seconds: 15 },
+    },
+    api,
+    logger,
+  );
+
+  expect(api.updateNotificationSettings).toHaveBeenCalledExactlyOnceWith({
+    ntfy_timeout_seconds: 15,
+  });
+});
+
+test("malformed notification settings payloads are rejected without dispatch", async () => {
+  const api = mockApi();
+
+  const empty = await handleApiBrokerRequest(
+    { type: "api.settings.notifications.update", payload: {} },
+    api,
+    logger,
+  );
+
+  expect(empty).toMatchObject({ ok: false, error: { kind: "broker" } });
+  expect(api.updateNotificationSettings).not.toHaveBeenCalled();
+});
+
+test("background mediates notification target CRUD and per-target test", async () => {
+  const api = mockApi();
+
+  await handleApiBrokerRequest({ type: "api.notificationTargets.list" }, api, logger);
+  await handleApiBrokerRequest(
+    {
+      type: "api.notificationTargets.create",
+      payload: { type: "ntfy", name: "Maxim iPhone", topic: "x" },
+    },
+    api,
+    logger,
+  );
+  await handleApiBrokerRequest(
+    { type: "api.notificationTargets.update", id: 1, payload: { enabled: false } },
+    api,
+    logger,
+  );
+  await handleApiBrokerRequest({ type: "api.notificationTargets.delete", id: 1 }, api, logger);
+  await handleApiBrokerRequest({ type: "api.notificationTargets.test", id: 1 }, api, logger);
+
+  expect(api.notificationTargets).toHaveBeenCalledOnce();
+  expect(api.createNotificationTarget).toHaveBeenCalledExactlyOnceWith({
+    type: "ntfy",
+    name: "Maxim iPhone",
+    topic: "x",
+  });
+  expect(api.updateNotificationTarget).toHaveBeenCalledExactlyOnceWith(1, { enabled: false });
+  expect(api.deleteNotificationTarget).toHaveBeenCalledExactlyOnceWith(1);
+  expect(api.testNotificationTarget).toHaveBeenCalledExactlyOnceWith(1);
 });
 
 test("unknown operations and injected top-level URLs are rejected", async () => {

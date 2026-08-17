@@ -6,7 +6,7 @@ from agent.app.core.config import Settings
 from agent.app.core.models import EnrichmentStatus, SearchCategory, SellerType
 from agent.app.main import create_app
 from agent.app.notifications.dispatcher import NotificationDispatcher
-from agent.app.notifications.service import FakeNotificationService, NtfyNotificationService
+from agent.app.notifications.service import FakeNotificationService
 from agent.app.notifications.sound import FakeDesktopNotificationSoundService
 from agent.app.willhaben.fake_provider import FakeListingProvider
 from agent.app.willhaben.marketplace_listing_enricher import (
@@ -65,7 +65,7 @@ async def test_search_crud_lifecycle(api_client: httpx.AsyncClient) -> None:
 
 
 @pytest.mark.asyncio
-async def test_search_notification_channel_toggles_default_on_and_are_patchable(
+async def test_search_notification_target_ids_default_empty_and_reject_unknown_ids(
     api_client: httpx.AsyncClient,
 ) -> None:
     created_response = await api_client.post(
@@ -73,40 +73,31 @@ async def test_search_notification_channel_toggles_default_on_and_are_patchable(
         json={"name": "Toggle", "category": "marketplace", "query": "ThinkPad"},
     )
     created = created_response.json()
-    assert created["notify_ntfy"] is True
-    assert created["notify_discord"] is True
-    assert created["notify_email"] is True
+    assert created["notification_target_ids"] == []
     assert created["notify_desktop_sound"] is True
-
-    updated = await api_client.patch(
-        f"/api/v1/searches/{created['id']}",
-        json={"notify_discord": False, "notify_email": False},
-    )
-    assert updated.status_code == 200
-    body = updated.json()
-    assert body["notify_discord"] is False
-    assert body["notify_email"] is False
-    assert body["notify_ntfy"] is True
-    assert body["notify_desktop_sound"] is True
 
     rejected = await api_client.patch(
         f"/api/v1/searches/{created['id']}",
-        json={"notify_ntfy": None},
+        json={"notify_desktop_sound": None},
     )
     assert rejected.status_code == 422
 
+    unknown_target = await api_client.patch(
+        f"/api/v1/searches/{created['id']}",
+        json={"notification_target_ids": [999999]},
+    )
+    assert unknown_target.status_code == 422
+
 
 @pytest.mark.asyncio
-async def test_status_reports_per_channel_notification_state(
+async def test_status_reports_aggregate_notification_state(
     api_client: httpx.AsyncClient,
 ) -> None:
     response = await api_client.get("/api/v1/status")
     body = response.json()
     assert response.status_code == 200
-    assert "discord_enabled" in body
-    assert "discord_disabled_reason" in body
-    assert "email_enabled" in body
-    assert "email_disabled_reason" in body
+    assert "notifications_enabled" in body
+    assert "notifications_disabled_reason" in body
 
 
 @pytest.mark.asyncio
@@ -141,7 +132,6 @@ async def test_detailed_status_endpoint(api_client: httpx.AsyncClient) -> None:
     assert body["pending_notifications"] == 0
     assert body["failed_notifications"] == 0
     assert body["last_successful_notification_at"] is None
-    assert body["ntfy_enabled"] is True
     assert body["desktop_sound_enabled"] is False
     assert body["desktop_sound_id"] == "notify"
     assert body["desktop_sound_available"] is False
@@ -164,24 +154,6 @@ async def test_status_and_recent_listing_reads_do_not_call_provider(
     await api_client.get("/api/v1/listings/recent", params={"limit": 1})
 
     assert provider.calls == []
-
-
-@pytest.mark.asyncio
-async def test_notification_test_endpoint_sends_without_creating_listing(
-    api_client: httpx.AsyncClient,
-    notifications: FakeNotificationService,
-) -> None:
-    response = await api_client.post("/api/v1/notifications/test")
-
-    assert response.status_code == 200
-    assert response.json() == {
-        "status": "sent",
-        "message": "Willhaben-Suchagent – Test erfolgreich",
-    }
-    assert notifications.test_notification_count == 1
-    status_response = await api_client.get("/api/v1/status")
-    assert status_response.json()["database_counts"]["listings"] == 0
-    assert status_response.json()["database_counts"]["notifications"] == 0
 
 
 @pytest.mark.asyncio
@@ -284,11 +256,10 @@ async def test_status_reports_cycle_notification_and_ntfy_state(
     assert body["active_searches"] == 1
     assert body["pending_notifications"] == 0
     assert body["last_successful_notification_at"] is not None
-    assert body["ntfy_enabled"] is True
 
 
 @pytest.mark.asyncio
-async def test_default_application_uses_real_provider_and_disabled_ntfy(
+async def test_default_application_uses_real_provider_and_no_targets_configured(
     settings: Settings,
 ) -> None:
     app = create_app(settings)
@@ -296,19 +267,14 @@ async def test_default_application_uses_real_provider_and_disabled_ntfy(
     assert app.state.scheduler.provider is app.state.provider
     assert isinstance(app.state.scheduler.listing_enricher, WillhabenMarketplaceListingEnricher)
     assert isinstance(app.state.notification_service, NotificationDispatcher)
-    assert isinstance(app.state.notification_channels["ntfy"], NtfyNotificationService)
-    assert app.state.notification_channels["ntfy"].enabled is False
     assert app.state.notification_service.enabled is False
 
     async with app.router.lifespan_context(app):
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-            response = await client.post("/api/v1/notifications/test")
             status_response = await client.get("/api/v1/status")
 
-    assert response.status_code == 503
-    assert status_response.json()["ntfy_enabled"] is False
-    assert status_response.json()["ntfy_disabled_reason"] == "NTFY_ENABLED is false"
+    assert status_response.json()["notifications_enabled"] is False
 
 
 @pytest.mark.asyncio
@@ -448,3 +414,120 @@ async def test_lifespan_starts_and_stops_single_scheduler(settings: Settings) ->
         assert app.state.scheduler._task.get_name() == "global-search-scheduler"
     assert app.state.health.scheduler_running is False
     assert app.state.scheduler._task is None
+
+
+IPHONE_URL = (
+    "https://www.willhaben.at/iad/kaufen-und-verkaufen/marktplatz/apple/"
+    "iphone-13-mini-5009987?keyword=iphone+13+mini&sfId=d16702ad-e779-4fc3-b3b5-"
+    "4442c66247a9&rows=30&isNavigation=true"
+)
+
+
+@pytest.mark.asyncio
+async def test_import_search_url_extracts_deep_category_and_drops_navigation_params(
+    api_client: httpx.AsyncClient,
+) -> None:
+    response = await api_client.post(
+        "/api/v1/marketplace/import-search-url", json={"url": IPHONE_URL}
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body == {
+        "category_path": "apple/iphone-13-mini-5009987",
+        "category_label": "Apple → iPhone 13 Mini",
+        "query": "iphone 13 mini",
+        "location": None,
+        "price_min": None,
+        "price_max": None,
+        "unsupported_filters": [],
+    }
+
+
+@pytest.mark.asyncio
+async def test_import_search_url_rejects_unsafe_urls(api_client: httpx.AsyncClient) -> None:
+    response = await api_client.post(
+        "/api/v1/marketplace/import-search-url",
+        json={"url": "https://example.com/iad/kaufen-und-verkaufen/marktplatz"},
+    )
+
+    assert response.status_code == 422
+    assert "example.com" not in response.text
+
+
+@pytest.mark.asyncio
+async def test_import_search_url_rejects_javascript_scheme(api_client: httpx.AsyncClient) -> None:
+    response = await api_client.post(
+        "/api/v1/marketplace/import-search-url", json={"url": "javascript:alert(1)"}
+    )
+
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_created_search_can_use_deep_imported_category_without_keyword(
+    api_client: httpx.AsyncClient,
+) -> None:
+    imported = await api_client.post(
+        "/api/v1/marketplace/import-search-url", json={"url": IPHONE_URL}
+    )
+    draft = imported.json()
+
+    created = await api_client.post(
+        "/api/v1/searches",
+        json={
+            "name": "iPhone 13 Mini",
+            "category": "marketplace",
+            "query": "",
+            "category_filters": {
+                "marketplace_category": draft["category_path"],
+                "marketplace_category_label": draft["category_label"],
+            },
+        },
+    )
+
+    assert created.status_code == 201
+    body = created.json()
+    assert body["query"] == ""
+    assert body["category_filters"]["marketplace_category"] == "apple/iphone-13-mini-5009987"
+
+
+@pytest.mark.asyncio
+async def test_backup_export_contains_no_secrets(api_client: httpx.AsyncClient) -> None:
+    await api_client.post(
+        "/api/v1/searches",
+        json={"name": "Notebook", "category": "marketplace", "query": "ThinkPad"},
+    )
+
+    export = await api_client.get("/api/v1/backup/export")
+    assert export.status_code == 200
+    document = export.json()
+    assert document["format_version"] == 1
+    assert "webhook" not in str(document).lower()
+
+    imported = await api_client.post("/api/v1/backup/import", json=document)
+    assert imported.status_code == 200
+    body = imported.json()
+    # Search already exists (same database) -> skipped, not duplicated.
+    assert body["searches_created"] == 0
+    assert body["searches_skipped"] == 1
+
+
+@pytest.mark.asyncio
+async def test_backup_import_rejects_broken_json(api_client: httpx.AsyncClient) -> None:
+    response = await api_client.post(
+        "/api/v1/backup/import",
+        content=b"{not valid json",
+        headers={"content-type": "application/json"},
+    )
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_backup_import_rejects_unsupported_format_version(
+    api_client: httpx.AsyncClient,
+) -> None:
+    response = await api_client.post(
+        "/api/v1/backup/import", json={"format_version": 999, "searches": []}
+    )
+    assert response.status_code == 422

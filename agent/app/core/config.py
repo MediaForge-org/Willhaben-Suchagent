@@ -4,6 +4,8 @@ from typing import Literal
 from pydantic import AliasChoices, Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from agent.app._version import __version__
+
 
 class Settings(BaseSettings):
     """Typed application configuration, overridable through environment variables."""
@@ -11,6 +13,9 @@ class Settings(BaseSettings):
     cycle_interval_seconds: float = Field(default=60, gt=0)
     max_concurrent_requests: int = Field(default=2, ge=1)
     database_path: Path = Path("data/willhaben_suchagent.db")
+    # None means "next to database_path, as secrets.json" — production launchers set
+    # this explicitly to the platform data directory (see agent/app/core/paths.py).
+    secret_store_path: Path | None = None
     api_host: str = "127.0.0.1"
     api_port: int = Field(default=8000, ge=1, le=65535)
     app_environment: Literal["development", "test", "production"] = "development"
@@ -19,7 +24,7 @@ class Settings(BaseSettings):
     desktop_sound_id: Literal["notify", "ping", "pop"] = "notify"
     log_level: str = "INFO"
     marketplace_user_agent: str = (
-        "Willhaben-Suchagent/0.3.1 (public Marketplace pages; no authentication)"
+        f"Willhaben-Suchagent/{__version__} (public Marketplace pages; no authentication)"
     )
     marketplace_connect_timeout_seconds: float = Field(default=10, gt=0)
     marketplace_read_timeout_seconds: float = Field(default=20, gt=0)

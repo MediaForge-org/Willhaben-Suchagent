@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import unicodedata
 from dataclasses import dataclass
 from decimal import Decimal
@@ -64,6 +65,9 @@ SUPPORTED_MARKETPLACE_CATEGORIES = (
     ("Smartphones & Telefonie", "smartphones-telefonie-2691"),
     ("Wohnen, Haushalt & Gastronomie", "wohnen-haushalt-gastronomie-5387"),
 )
+_CATEGORY_SEGMENT_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+
+
 SUPPORTED_MARKETPLACE_LOCATIONS = (
     "Burgenland",
     "Kärnten",
@@ -75,6 +79,22 @@ SUPPORTED_MARKETPLACE_LOCATIONS = (
     "Vorarlberg",
     "Wien",
 )
+
+
+def _normalized_key(value: object) -> str:
+    text = unicodedata.normalize("NFKD", str(value).strip().casefold())
+    return "".join(character for character in text if not unicodedata.combining(character))
+
+
+_AREA_ID_TO_LOCATION = {
+    _REGION_IDS[_normalized_key(name)]: name for name in SUPPORTED_MARKETPLACE_LOCATIONS
+}
+
+
+def region_name_for_area_id(area_id: str) -> str | None:
+    """Reverse-lookup a Willhaben ``areaId`` back to the canonical display name."""
+
+    return _AREA_ID_TO_LOCATION.get(area_id.strip())
 
 
 class UnsupportedMarketplaceSearch(ValueError):
@@ -95,7 +115,10 @@ class MarketplaceSearchBuilder:
 
         path = MARKETPLACE_BASE_URL
         category = search.category_filters.get("marketplace_category")
-        unsupported = set(search.category_filters) - {"marketplace_category"}
+        unsupported = set(search.category_filters) - {
+            "marketplace_category",
+            "marketplace_category_label",
+        }
         if unsupported:
             names = ", ".join(sorted(unsupported))
             raise UnsupportedMarketplaceSearch(f"Unsupported Marketplace filters: {names}")
@@ -124,13 +147,8 @@ class MarketplaceSearchBuilder:
             normalized = normalized.rstrip("0").rstrip(".")
         return normalized
 
-    @staticmethod
-    def _normalized_key(value: object) -> str:
-        text = unicodedata.normalize("NFKD", str(value).strip().casefold())
-        return "".join(character for character in text if not unicodedata.combining(character))
-
     def _region_id(self, location: str) -> str:
-        key = self._normalized_key(location)
+        key = _normalized_key(location)
         if key in _REGION_IDS:
             return _REGION_IDS[key]
         if location.strip() in _REGION_IDS.values():
@@ -140,13 +158,28 @@ class MarketplaceSearchBuilder:
         )
 
     def _category_path(self, category: object) -> str:
-        key = self._normalized_key(category)
+        key = _normalized_key(category)
         path = _CATEGORY_PATHS.get(key)
         if path is not None:
             return path
         raw = str(category).strip().casefold()
         if raw in _CATEGORY_PATHS.values():
             return raw
+        # A deep, multi-segment category path (e.g. "apple/iphone-13-mini-5009987") is only
+        # ever produced by our own URL importer parsing a real public Willhaben search URL
+        # (see agent/app/willhaben/search_url_import.py) — never guessed from free text. A
+        # single unverified segment (no "/") must still match the known top-level list above.
+        if self._is_deep_category_path(raw):
+            return raw
         raise UnsupportedMarketplaceSearch(
             "marketplace_category must be a supported name, ID, or SEO category segment"
+        )
+
+    @staticmethod
+    def _is_deep_category_path(value: str) -> bool:
+        if "/" not in value:
+            return False
+        segments = value.split("/")
+        return len(segments) >= 2 and all(
+            _CATEGORY_SEGMENT_RE.match(segment) for segment in segments
         )

@@ -29,8 +29,10 @@ secrets/
 
 build/
 dist/
+dist-release/
 *.egg-info/
 .eggs/
+*.xpi
 
 .idea/
 .vscode/

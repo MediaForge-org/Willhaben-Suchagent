@@ -1,6 +1,6 @@
 from datetime import datetime
 from decimal import Decimal
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -17,9 +17,7 @@ class SearchPayloadBase(BaseModel):
     price_max: Decimal | None = Field(default=None, ge=0)
     category_filters: dict[str, Any] = Field(default_factory=dict)
     default_template_id: int | None = Field(default=None, ge=1)
-    notify_ntfy: bool = True
-    notify_discord: bool = True
-    notify_email: bool = True
+    notification_target_ids: list[int] = Field(default_factory=list)
     notify_desktop_sound: bool = True
 
     @model_validator(mode="after")
@@ -46,9 +44,7 @@ class SearchPatch(BaseModel):
     price_max: Decimal | None = Field(default=None, ge=0)
     category_filters: dict[str, Any] | None = None
     default_template_id: int | None = Field(default=None, ge=1)
-    notify_ntfy: bool | None = None
-    notify_discord: bool | None = None
-    notify_email: bool | None = None
+    notification_target_ids: list[int] | None = None
     notify_desktop_sound: bool | None = None
 
 
@@ -76,6 +72,7 @@ class HealthResponse(BaseModel):
 
 
 class StatusResponse(HealthResponse):
+    app_version: str
     environment: str
     scheduler_running: bool
     cycle_interval_seconds: float
@@ -87,12 +84,8 @@ class StatusResponse(HealthResponse):
     pending_notifications: int
     failed_notifications: int
     last_successful_notification_at: datetime | None
-    ntfy_enabled: bool
-    ntfy_disabled_reason: str | None
-    discord_enabled: bool
-    discord_disabled_reason: str | None
-    email_enabled: bool
-    email_disabled_reason: str | None
+    notifications_enabled: bool
+    notifications_disabled_reason: str | None
     desktop_sound_enabled: bool
     desktop_sound_id: str
     desktop_sound_available: bool
@@ -134,10 +127,92 @@ class DesktopSoundOption(BaseModel):
     name: str
 
 
+class GlobalNotificationSettingsResponse(BaseModel):
+    """Shared, provider-technical settings only — per-destination config lives in
+    notification targets (see NotificationTargetResponse)."""
+
+    ntfy_timeout_seconds: float
+    discord_timeout_seconds: float
+    email_smtp_host: str | None
+    email_smtp_port: int
+    email_smtp_username: str | None
+    email_smtp_password_configured: bool
+    email_from_address: str | None
+    email_encryption: Literal["starttls", "ssl", "none"]
+    email_timeout_seconds: float
+
+
+class GlobalNotificationSettingsPatch(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    ntfy_timeout_seconds: float | None = Field(default=None, gt=0, le=120)
+    discord_timeout_seconds: float | None = Field(default=None, gt=0, le=120)
+    email_smtp_host: str | None = Field(default=None, max_length=300)
+    email_smtp_port: int | None = Field(default=None, ge=1, le=65535)
+    email_smtp_username: str | None = Field(default=None, max_length=300)
+    email_smtp_password: str | None = Field(default=None, max_length=500)
+    email_from_address: str | None = Field(default=None, max_length=300)
+    email_encryption: Literal["starttls", "ssl", "none"] | None = None
+    email_timeout_seconds: float | None = Field(default=None, gt=0, le=120)
+
+
 class AgentSettingsResponse(BaseModel):
     desktop_sound_enabled: bool
     desktop_sound_id: str
     desktop_sounds: list[DesktopSoundOption]
+    notifications: GlobalNotificationSettingsResponse | None = None
+
+
+class ChannelTestResponse(BaseModel):
+    status: str
+    message: str
+
+
+class NotificationTargetResponse(BaseModel):
+    id: int
+    type: Literal["ntfy", "discord", "email"]
+    name: str
+    enabled: bool
+    configured: bool
+    ntfy_base_url: str | None
+    ntfy_topic_configured: bool
+    ntfy_token_configured: bool
+    discord_webhook_configured: bool
+    email_address: str | None
+    email_address_masked: str | None
+    usage_count: int = 0
+    created_at: str
+    updated_at: str
+
+
+class NotificationTargetCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["ntfy", "discord", "email"]
+    name: str = Field(min_length=1, max_length=200)
+    enabled: bool = True
+    base_url: str | None = Field(default=None, max_length=500)
+    topic: str | None = Field(default=None, max_length=200)
+    token: str | None = Field(default=None, max_length=500)
+    webhook_url: str | None = Field(default=None, max_length=500)
+    email_address: str | None = Field(default=None, max_length=300)
+
+
+class NotificationTargetPatch(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str | None = Field(default=None, min_length=1, max_length=200)
+    enabled: bool | None = None
+    base_url: str | None = Field(default=None, max_length=500)
+    topic: str | None = Field(default=None, max_length=200)
+    token: str | None = Field(default=None, max_length=500)
+    webhook_url: str | None = Field(default=None, max_length=500)
+    email_address: str | None = Field(default=None, max_length=300)
+
+
+class NotificationTargetDeleteResponse(BaseModel):
+    deleted: bool
+    searches_affected: int
 
 
 class AgentSettingsPatch(BaseModel):
@@ -195,3 +270,28 @@ class MarketplaceOption(BaseModel):
 class MarketplaceOptionsResponse(BaseModel):
     categories: list[MarketplaceOption]
     locations: list[MarketplaceOption]
+
+
+class ImportSearchUrlRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    url: str = Field(min_length=1, max_length=2000)
+
+
+class ImportedSearchDraftResponse(BaseModel):
+    category_path: str | None
+    category_label: str | None
+    query: str
+    location: str | None
+    price_min: Decimal | None
+    price_max: Decimal | None
+    unsupported_filters: list[str]
+
+
+class BackupImportSummaryResponse(BaseModel):
+    templates_created: int
+    templates_skipped: int
+    notification_targets_created: int
+    notification_targets_skipped: int
+    searches_created: int
+    searches_skipped: int

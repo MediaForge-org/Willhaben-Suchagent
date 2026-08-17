@@ -4,7 +4,7 @@ import asyncio
 import json
 from collections.abc import AsyncIterator, Iterable
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
@@ -38,9 +38,7 @@ class SearchCreateData:
     price_max: Decimal | None
     category_filters: dict[str, Any]
     default_template_id: int | None = None
-    notify_ntfy: bool = True
-    notify_discord: bool = True
-    notify_email: bool = True
+    notification_target_ids: list[int] = field(default_factory=list)
     notify_desktop_sound: bool = True
 
 
@@ -54,6 +52,86 @@ class TemplateCreateData:
 class DesktopSoundPreferences:
     enabled: bool
     sound_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class NotificationSettingsRecord:
+    """Global, provider-technical notification settings.
+
+    Per-destination configuration (which ntfy topic, which Discord webhook, which
+    e-mail recipient) lives in ``notification_targets`` instead — see
+    NotificationTargetRecord. Only the SMTP *sender* account and per-channel
+    request timeouts stay global, since they are shared by every target of that
+    type rather than being a property of any one destination.
+    """
+
+    ntfy_timeout_seconds: float
+    discord_timeout_seconds: float
+    email_smtp_host: str | None
+    email_smtp_port: int
+    email_smtp_username: str | None
+    email_from_address: str | None
+    email_encryption: str
+    email_timeout_seconds: float
+
+
+_NOTIFICATION_SETTINGS_BOOL_KEYS: tuple[str, ...] = ()
+_NOTIFICATION_SETTINGS_INT_KEYS = ("email_smtp_port",)
+_NOTIFICATION_SETTINGS_FLOAT_KEYS = (
+    "ntfy_timeout_seconds",
+    "discord_timeout_seconds",
+    "email_timeout_seconds",
+)
+_NOTIFICATION_SETTINGS_KEYS = tuple(NotificationSettingsRecord.__dataclass_fields__)
+
+
+def _default_notification_settings() -> NotificationSettingsRecord:
+    return NotificationSettingsRecord(
+        ntfy_timeout_seconds=10,
+        discord_timeout_seconds=10,
+        email_smtp_host=None,
+        email_smtp_port=587,
+        email_smtp_username=None,
+        email_from_address=None,
+        email_encryption="starttls",
+        email_timeout_seconds=10,
+    )
+
+
+def _encode_notification_setting(key: str, value: Any) -> str:
+    if key in _NOTIFICATION_SETTINGS_BOOL_KEYS:
+        return "1" if value else "0"
+    if value is None:
+        return ""
+    return str(value)
+
+
+def _decode_notification_setting(key: str, raw: str | None) -> Any:
+    if raw is None or raw == "":
+        return None
+    if key in _NOTIFICATION_SETTINGS_BOOL_KEYS:
+        return raw == "1"
+    if key in _NOTIFICATION_SETTINGS_INT_KEYS:
+        return int(raw)
+    if key in _NOTIFICATION_SETTINGS_FLOAT_KEYS:
+        return float(raw)
+    return raw
+
+
+def _notification_settings_to_raw(record: NotificationSettingsRecord) -> dict[str, str]:
+    return {
+        key: _encode_notification_setting(key, getattr(record, key))
+        for key in _NOTIFICATION_SETTINGS_KEYS
+    }
+
+
+def _raw_to_notification_settings(raw: dict[str, str]) -> NotificationSettingsRecord:
+    defaults = _default_notification_settings()
+    values: dict[str, Any] = {}
+    for key in _NOTIFICATION_SETTINGS_KEYS:
+        decoded = _decode_notification_setting(key, raw.get(key))
+        values[key] = decoded if decoded is not None else getattr(defaults, key)
+    return NotificationSettingsRecord(**values)
 
 
 @dataclass(slots=True)
@@ -72,14 +150,26 @@ class PendingNotification:
     attempt_count: int
 
 
-PUSH_CHANNELS: tuple[str, ...] = ("ntfy", "discord", "email")
+NOTIFICATION_TARGET_TYPES: tuple[str, ...] = ("ntfy", "discord", "email")
+
+
+@dataclass(frozen=True, slots=True)
+class NotificationTargetRecord:
+    id: int
+    type: str
+    name: str
+    enabled: bool
+    ntfy_base_url: str | None
+    email_address: str | None
+    created_at: datetime
+    updated_at: datetime
 
 
 @dataclass(slots=True)
-class ChannelDispatchState:
+class TargetDispatchState:
     listing_id: int
-    enabled_channels: set[str]
-    channel_statuses: dict[str, str]
+    target_ids: set[int]
+    target_statuses: dict[int, str]
 
 
 @dataclass(slots=True)
@@ -114,6 +204,7 @@ class Database:
         *,
         desktop_sound_enabled: bool = True,
         desktop_sound_id: str = DEFAULT_SOUND_ID,
+        notification_settings_seed: NotificationSettingsRecord | None = None,
     ) -> None:
         if desktop_sound_id not in SOUND_VARIANTS:
             raise ValueError(f"Unsupported desktop sound id: {desktop_sound_id}")
@@ -131,7 +222,50 @@ class Database:
                 desktop_sound_enabled=desktop_sound_enabled,
                 desktop_sound_id=desktop_sound_id,
             )
+            await self._ensure_notification_settings(
+                connection, notification_settings_seed or _default_notification_settings()
+            )
             await connection.commit()
+
+    @staticmethod
+    async def _ensure_notification_settings(
+        connection: aiosqlite.Connection, seed: NotificationSettingsRecord
+    ) -> None:
+        raw = _notification_settings_to_raw(seed)
+        await connection.executemany(
+            "INSERT OR IGNORE INTO agent_settings(key, value) VALUES (?, ?)",
+            list(raw.items()),
+        )
+
+    async def get_notification_settings(self) -> NotificationSettingsRecord:
+        async with self._connect() as connection:
+            placeholders = ",".join("?" for _ in _NOTIFICATION_SETTINGS_KEYS)
+            cursor = await connection.execute(
+                f"SELECT key, value FROM agent_settings WHERE key IN ({placeholders})",  # noqa: S608
+                _NOTIFICATION_SETTINGS_KEYS,
+            )
+            raw = {row["key"]: row["value"] for row in await cursor.fetchall()}
+        return _raw_to_notification_settings(raw)
+
+    async def update_notification_settings(
+        self, changes: dict[str, Any]
+    ) -> NotificationSettingsRecord:
+        if not changes or not set(changes) <= set(_NOTIFICATION_SETTINGS_KEYS):
+            raise ValueError("Unsupported notification setting key")
+        current = await self.get_notification_settings()
+        merged = {key: getattr(current, key) for key in _NOTIFICATION_SETTINGS_KEYS}
+        merged.update(changes)
+        validated = NotificationSettingsRecord(**merged)
+        raw = _notification_settings_to_raw(validated)
+        rows = [(key, raw[key]) for key in changes]
+        async with self._write_lock, self._connect() as connection:
+            await connection.executemany(
+                "INSERT INTO agent_settings(key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                rows,
+            )
+            await connection.commit()
+        return await self.get_notification_settings()
 
     @staticmethod
     async def _ensure_agent_settings(
@@ -304,8 +438,21 @@ class Database:
         }
         return json.dumps(payload, separators=(",", ":"), sort_keys=True)
 
+    _SEARCH_SELECT = (
+        "SELECT searches.*, "
+        "(SELECT GROUP_CONCAT(target_id) FROM search_notification_targets "
+        " WHERE search_id = searches.id) AS notification_target_ids "
+        "FROM searches"
+    )
+
     @staticmethod
-    def _row_to_search(row: aiosqlite.Row) -> SearchDefinition:
+    def _parse_target_ids(raw: str | None) -> list[int]:
+        if not raw:
+            return []
+        return [int(value) for value in raw.split(",")]
+
+    @classmethod
+    def _row_to_search(cls, row: aiosqlite.Row) -> SearchDefinition:
         query_data = json.loads(row["query_json"])
         return SearchDefinition(
             id=row["id"],
@@ -319,12 +466,24 @@ class Database:
             last_success_at=row["last_success_at"],
             consecutive_errors=row["consecutive_errors"],
             default_template_id=row["default_template_id"],
-            notify_ntfy=bool(row["notify_ntfy"]),
-            notify_discord=bool(row["notify_discord"]),
-            notify_email=bool(row["notify_email"]),
+            notification_target_ids=cls._parse_target_ids(row["notification_target_ids"]),
             notify_desktop_sound=bool(row["notify_desktop_sound"]),
             **query_data,
         )
+
+    @staticmethod
+    async def _set_search_targets(
+        connection: aiosqlite.Connection, search_id: int, target_ids: list[int]
+    ) -> None:
+        deduped = sorted(set(target_ids))
+        await connection.execute(
+            "DELETE FROM search_notification_targets WHERE search_id = ?", (search_id,)
+        )
+        if deduped:
+            await connection.executemany(
+                "INSERT INTO search_notification_targets(search_id, target_id) VALUES (?, ?)",
+                [(search_id, target_id) for target_id in deduped],
+            )
 
     async def create_search(self, data: SearchCreateData) -> SearchDefinition:
         timestamp = to_db_timestamp()
@@ -333,9 +492,8 @@ class Database:
                 """
                 INSERT INTO searches (
                     name, category, query_json, enabled, baseline_initialized,
-                    created_at, updated_at, default_template_id,
-                    notify_ntfy, notify_discord, notify_email, notify_desktop_sound
-                ) VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?)
+                    created_at, updated_at, default_template_id, notify_desktop_sound
+                ) VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?)
                 """,
                 (
                     data.name,
@@ -345,16 +503,14 @@ class Database:
                     timestamp,
                     timestamp,
                     data.default_template_id,
-                    int(data.notify_ntfy),
-                    int(data.notify_discord),
-                    int(data.notify_email),
                     int(data.notify_desktop_sound),
                 ),
             )
-            await connection.commit()
             search_id = cursor.lastrowid
-        if search_id is None:
-            raise RuntimeError("SQLite did not return a search id")
+            if search_id is None:
+                raise RuntimeError("SQLite did not return a search id")
+            await self._set_search_targets(connection, search_id, data.notification_target_ids)
+            await connection.commit()
         search = await self.get_search(search_id)
         if search is None:
             raise RuntimeError("Created search could not be reloaded")
@@ -362,19 +518,22 @@ class Database:
 
     async def get_search(self, search_id: int) -> SearchDefinition | None:
         async with self._connect() as connection:
-            cursor = await connection.execute("SELECT * FROM searches WHERE id = ?", (search_id,))
+            cursor = await connection.execute(
+                f"{self._SEARCH_SELECT} WHERE searches.id = ?",  # noqa: S608
+                (search_id,),
+            )
             row = await cursor.fetchone()
         return self._row_to_search(row) if row else None
 
     async def list_searches(self, *, enabled_only: bool = False) -> list[SearchDefinition]:
-        query = "SELECT * FROM searches"
+        query = self._SEARCH_SELECT
         parameters: tuple[Any, ...] = ()
         if enabled_only:
-            query += " WHERE enabled = ?"
+            query += " WHERE searches.enabled = ?"
             parameters = (1,)
-        query += " ORDER BY id"
+        query += " ORDER BY searches.id"
         async with self._connect() as connection:
-            cursor = await connection.execute(query, parameters)
+            cursor = await connection.execute(query, parameters)  # noqa: S608
             rows = await cursor.fetchall()
         return [self._row_to_search(row) for row in rows]
 
@@ -395,9 +554,7 @@ class Database:
             "price_max",
             "category_filters",
             "default_template_id",
-            "notify_ntfy",
-            "notify_discord",
-            "notify_email",
+            "notification_target_ids",
             "notify_desktop_sound",
         }
         merged = current.model_dump()
@@ -420,7 +577,6 @@ class Database:
                 UPDATE searches
                 SET name = ?, category = ?, query_json = ?, enabled = ?,
                     baseline_initialized = ?, updated_at = ?, default_template_id = ?,
-                    notify_ntfy = ?, notify_discord = ?, notify_email = ?,
                     notify_desktop_sound = ?
                 WHERE id = ?
                 """,
@@ -432,13 +588,14 @@ class Database:
                     0 if reset_baseline else int(current.baseline_initialized),
                     timestamp,
                     validated.default_template_id,
-                    int(validated.notify_ntfy),
-                    int(validated.notify_discord),
-                    int(validated.notify_email),
                     int(validated.notify_desktop_sound),
                     search_id,
                 ),
             )
+            if "notification_target_ids" in changes:
+                await self._set_search_targets(
+                    connection, search_id, validated.notification_target_ids
+                )
             await connection.commit()
         return await self.get_search(search_id)
 
@@ -756,10 +913,11 @@ class Database:
             )
             await connection.commit()
 
-    async def load_channel_dispatch_state(
+    async def load_target_dispatch_state(
         self, provider_listing_id: str
-    ) -> ChannelDispatchState | None:
-        """Load the per-search channel toggles and persisted per-channel delivery state."""
+    ) -> TargetDispatchState | None:
+        """Load the union of notification targets across every matching search, plus
+        the already-persisted per-target delivery state for this listing."""
 
         async with self._connect() as connection:
             cursor = await connection.execute(
@@ -773,72 +931,61 @@ class Database:
 
             cursor = await connection.execute(
                 """
-                SELECT
-                    MAX(searches.notify_ntfy) AS notify_ntfy,
-                    MAX(searches.notify_discord) AS notify_discord,
-                    MAX(searches.notify_email) AS notify_email
+                SELECT DISTINCT search_notification_targets.target_id
                 FROM search_matches
                 JOIN searches ON searches.id = search_matches.search_id
+                JOIN search_notification_targets
+                    ON search_notification_targets.search_id = searches.id
                 WHERE search_matches.listing_id = ?
                 """,
                 (listing_id,),
             )
-            toggles_row = await cursor.fetchone()
-            enabled_channels = {
-                channel
-                for channel, column in zip(
-                    PUSH_CHANNELS,
-                    ("notify_ntfy", "notify_discord", "notify_email"),
-                    strict=True,
-                )
-                if toggles_row is not None and toggles_row[column]
-            }
+            target_rows = await cursor.fetchall()
+            target_ids = {row["target_id"] for row in target_rows}
 
             cursor = await connection.execute(
-                "SELECT channel, status FROM channel_deliveries WHERE listing_id = ?",
+                "SELECT target_id, status FROM notification_deliveries WHERE listing_id = ?",
                 (listing_id,),
             )
             status_rows = await cursor.fetchall()
 
-        return ChannelDispatchState(
+        return TargetDispatchState(
             listing_id=listing_id,
-            enabled_channels=enabled_channels,
-            channel_statuses={row["channel"]: row["status"] for row in status_rows},
+            target_ids=target_ids,
+            target_statuses={row["target_id"]: row["status"] for row in status_rows},
         )
 
-    async def record_channel_delivery_attempt(
+    async def record_target_delivery_attempt(
         self,
         listing_id: int,
-        channel: str,
+        target_id: int,
         *,
         sent: bool,
         error: str | None = None,
     ) -> None:
-        if channel not in PUSH_CHANNELS:
-            raise ValueError(f"Unsupported notification channel: {channel}")
         timestamp = to_db_timestamp()
         status = "sent" if sent else "failed"
         async with self._write_lock, self._connect() as connection:
             await connection.execute(
                 """
-                INSERT INTO channel_deliveries(
-                    listing_id, channel, status, attempt_count,
+                INSERT INTO notification_deliveries(
+                    listing_id, target_id, status, attempt_count,
                     created_at, updated_at, last_attempt_at, sent_at, last_error
                 ) VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?)
-                ON CONFLICT(listing_id, channel) DO UPDATE SET
+                ON CONFLICT(listing_id, target_id) DO UPDATE SET
                     status = excluded.status,
-                    attempt_count = channel_deliveries.attempt_count + 1,
+                    attempt_count = notification_deliveries.attempt_count + 1,
                     updated_at = excluded.updated_at,
                     last_attempt_at = excluded.last_attempt_at,
                     sent_at = CASE
                         WHEN excluded.status = 'sent' THEN excluded.updated_at
-                        ELSE channel_deliveries.sent_at
+                        ELSE notification_deliveries.sent_at
                     END,
                     last_error = excluded.last_error
                 """,
                 (
                     listing_id,
-                    channel,
+                    target_id,
                     status,
                     timestamp,
                     timestamp,
@@ -849,26 +996,227 @@ class Database:
             )
             await connection.commit()
 
-    async def record_channel_delivery_skipped(self, listing_id: int, channel: str) -> None:
-        """Persist that one channel was not attempted, without touching a 'sent' outcome."""
+    async def record_target_delivery_skipped(self, listing_id: int, target_id: int) -> None:
+        """Persist that one target was not attempted, without touching a 'sent' outcome."""
 
-        if channel not in PUSH_CHANNELS:
-            raise ValueError(f"Unsupported notification channel: {channel}")
         timestamp = to_db_timestamp()
         async with self._write_lock, self._connect() as connection:
             await connection.execute(
                 """
-                INSERT INTO channel_deliveries(
-                    listing_id, channel, status, attempt_count, created_at, updated_at
+                INSERT INTO notification_deliveries(
+                    listing_id, target_id, status, attempt_count, created_at, updated_at
                 ) VALUES (?, ?, 'skipped', 0, ?, ?)
-                ON CONFLICT(listing_id, channel) DO UPDATE SET
+                ON CONFLICT(listing_id, target_id) DO UPDATE SET
                     status = CASE
-                        WHEN channel_deliveries.status = 'sent' THEN channel_deliveries.status
+                        WHEN notification_deliveries.status = 'sent'
+                        THEN notification_deliveries.status
                         ELSE 'skipped'
                     END,
                     updated_at = excluded.updated_at
                 """,
-                (listing_id, channel, timestamp, timestamp),
+                (listing_id, target_id, timestamp, timestamp),
+            )
+            await connection.commit()
+
+    # -- Notification targets (reusable ntfy/Discord/e-mail destinations) --------------
+
+    @staticmethod
+    def _row_to_target(row: aiosqlite.Row) -> NotificationTargetRecord:
+        return NotificationTargetRecord(
+            id=row["id"],
+            type=row["type"],
+            name=row["name"],
+            enabled=bool(row["enabled"]),
+            ntfy_base_url=row["ntfy_base_url"],
+            email_address=row["email_address"],
+            created_at=datetime.fromisoformat(row["created_at"]),
+            updated_at=datetime.fromisoformat(row["updated_at"]),
+        )
+
+    async def create_notification_target(
+        self,
+        *,
+        type: str,  # noqa: A002
+        name: str,
+        enabled: bool = True,
+        ntfy_base_url: str | None = None,
+        email_address: str | None = None,
+    ) -> NotificationTargetRecord:
+        if type not in NOTIFICATION_TARGET_TYPES:
+            raise ValueError(f"Unsupported notification target type: {type}")
+        timestamp = to_db_timestamp()
+        async with self._write_lock, self._connect() as connection:
+            cursor = await connection.execute(
+                """
+                INSERT INTO notification_targets(
+                    type, name, enabled, ntfy_base_url, email_address, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    type,
+                    name,
+                    int(enabled),
+                    ntfy_base_url,
+                    email_address,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            target_id = cursor.lastrowid
+            await connection.commit()
+        if target_id is None:
+            raise RuntimeError("SQLite did not return a notification target id")
+        target = await self.get_notification_target(target_id)
+        if target is None:
+            raise RuntimeError("Created notification target could not be reloaded")
+        return target
+
+    async def get_notification_target(self, target_id: int) -> NotificationTargetRecord | None:
+        async with self._connect() as connection:
+            cursor = await connection.execute(
+                "SELECT * FROM notification_targets WHERE id = ?", (target_id,)
+            )
+            row = await cursor.fetchone()
+        return self._row_to_target(row) if row else None
+
+    async def list_notification_targets(
+        self,
+        *,
+        type: str | None = None,  # noqa: A002
+    ) -> list[NotificationTargetRecord]:
+        query = "SELECT * FROM notification_targets"
+        parameters: tuple[Any, ...] = ()
+        if type is not None:
+            query += " WHERE type = ?"
+            parameters = (type,)
+        query += " ORDER BY type, name, id"
+        async with self._connect() as connection:
+            cursor = await connection.execute(query, parameters)  # noqa: S608
+            rows = await cursor.fetchall()
+        return [self._row_to_target(row) for row in rows]
+
+    async def update_notification_target(
+        self, target_id: int, changes: dict[str, Any]
+    ) -> NotificationTargetRecord | None:
+        current = await self.get_notification_target(target_id)
+        if current is None:
+            return None
+        allowed = {"name", "enabled", "ntfy_base_url", "email_address"}
+        if not set(changes) <= allowed:
+            raise ValueError("Unsupported notification target field")
+        name = changes.get("name", current.name)
+        enabled = changes.get("enabled", current.enabled)
+        ntfy_base_url = changes.get("ntfy_base_url", current.ntfy_base_url)
+        email_address = changes.get("email_address", current.email_address)
+        timestamp = to_db_timestamp()
+        async with self._write_lock, self._connect() as connection:
+            await connection.execute(
+                """
+                UPDATE notification_targets
+                SET name = ?, enabled = ?, ntfy_base_url = ?, email_address = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (name, int(enabled), ntfy_base_url, email_address, timestamp, target_id),
+            )
+            await connection.commit()
+        return await self.get_notification_target(target_id)
+
+    async def delete_notification_target(self, target_id: int) -> bool:
+        async with self._write_lock, self._connect() as connection:
+            cursor = await connection.execute(
+                "DELETE FROM notification_targets WHERE id = ?", (target_id,)
+            )
+            await connection.commit()
+        return cursor.rowcount > 0
+
+    async def count_searches_using_target(self, target_id: int) -> int:
+        async with self._connect() as connection:
+            cursor = await connection.execute(
+                "SELECT COUNT(DISTINCT search_id) FROM search_notification_targets "
+                "WHERE target_id = ?",
+                (target_id,),
+            )
+            row = await cursor.fetchone()
+        return int(row[0])
+
+    # -- One-time migration helpers (M5/M6 -> notification targets) --------------------
+
+    async def seed_legacy_agent_settings(self, raw: dict[str, str]) -> None:
+        """One-time env-var bootstrap for the pre-target legacy config keys.
+
+        Only ever consumed by the migration in
+        agent/app/notifications/target_migration.py on a brand-new install where the
+        user already had NTFY_*/DISCORD_*/EMAIL_* variables in .env — it lets those
+        still create the equivalent default targets on first startup.
+        """
+
+        if not raw:
+            return
+        async with self._write_lock, self._connect() as connection:
+            await connection.executemany(
+                "INSERT OR IGNORE INTO agent_settings(key, value) VALUES (?, ?)",
+                list(raw.items()),
+            )
+            await connection.commit()
+
+    async def get_legacy_notification_config(self) -> dict[str, str]:
+        """Read pre-target global settings rows still sitting in agent_settings, if any.
+
+        Only ever used by the one-time migration in
+        agent/app/notifications/target_migration.py; the live application no longer
+        reads or writes these keys.
+        """
+
+        legacy_keys = (
+            "ntfy_enabled",
+            "ntfy_base_url",
+            "ntfy_topic",
+            "discord_enabled",
+            "email_enabled",
+            "email_to_address",
+        )
+        placeholders = ",".join("?" for _ in legacy_keys)
+        async with self._connect() as connection:
+            cursor = await connection.execute(
+                f"SELECT key, value FROM agent_settings WHERE key IN ({placeholders})",  # noqa: S608
+                legacy_keys,
+            )
+            rows = await cursor.fetchall()
+        return {row["key"]: row["value"] for row in rows}
+
+    async def list_search_legacy_channel_flags(self) -> list[tuple[int, bool, bool, bool]]:
+        """Read the pre-target per-search notify_ntfy/discord/email booleans directly.
+
+        Only used by the one-time migration; the live application derives per-search
+        delivery targets from search_notification_targets instead.
+        """
+
+        async with self._connect() as connection:
+            cursor = await connection.execute(
+                "SELECT id, notify_ntfy, notify_discord, notify_email FROM searches"
+            )
+            rows = await cursor.fetchall()
+        return [
+            (
+                row["id"],
+                bool(row["notify_ntfy"]),
+                bool(row["notify_discord"]),
+                bool(row["notify_email"]),
+            )
+            for row in rows
+        ]
+
+    async def link_search_to_target(self, search_id: int, target_id: int) -> None:
+        """Add one target to a search's notification targets without touching the rest.
+
+        Used by the one-time legacy migration; normal writes go through update_search.
+        """
+
+        async with self._write_lock, self._connect() as connection:
+            await connection.execute(
+                "INSERT OR IGNORE INTO search_notification_targets(search_id, target_id) "
+                "VALUES (?, ?)",
+                (search_id, target_id),
             )
             await connection.commit()
 

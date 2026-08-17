@@ -1,5 +1,6 @@
 import sqlite3
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -257,36 +258,37 @@ async def test_initialize_migrates_legacy_searches_with_notification_channel_def
 
 
 @pytest.mark.asyncio
-async def test_channel_delivery_status_persists_and_is_not_overwritten_after_sent(
+async def test_target_delivery_status_persists_and_is_not_overwritten_after_sent(
     database: Database,
     search_data: SearchCreateData,
     listing_factory: Callable[..., Listing],
 ) -> None:
-    search = await database.create_search(search_data)
+    target = await database.create_notification_target(type="ntfy", name="Maxim iPhone")
+    search = await database.create_search(replace(search_data, notification_target_ids=[target.id]))
     await database.persist_cycle_results([(search, [])])
     initialized = await database.get_search(search.id)
     assert initialized is not None
     listing = listing_factory("channel-status")
     await database.persist_cycle_results([(initialized, [listing])])
 
-    state = await database.load_channel_dispatch_state("channel-status")
+    state = await database.load_target_dispatch_state("channel-status")
     assert state is not None
-    assert state.enabled_channels == {"ntfy", "discord", "email"}
-    assert state.channel_statuses == {}
+    assert state.target_ids == {target.id}
+    assert state.target_statuses == {}
 
-    await database.record_channel_delivery_attempt(
-        state.listing_id, "ntfy", sent=False, error="boom"
+    await database.record_target_delivery_attempt(
+        state.listing_id, target.id, sent=False, error="boom"
     )
-    failed_state = await database.load_channel_dispatch_state("channel-status")
+    failed_state = await database.load_target_dispatch_state("channel-status")
     assert failed_state is not None
-    assert failed_state.channel_statuses["ntfy"] == "failed"
+    assert failed_state.target_statuses[target.id] == "failed"
 
-    await database.record_channel_delivery_attempt(state.listing_id, "ntfy", sent=True)
-    sent_state = await database.load_channel_dispatch_state("channel-status")
+    await database.record_target_delivery_attempt(state.listing_id, target.id, sent=True)
+    sent_state = await database.load_target_dispatch_state("channel-status")
     assert sent_state is not None
-    assert sent_state.channel_statuses["ntfy"] == "sent"
+    assert sent_state.target_statuses[target.id] == "sent"
 
-    await database.record_channel_delivery_skipped(state.listing_id, "ntfy")
-    unchanged_state = await database.load_channel_dispatch_state("channel-status")
+    await database.record_target_delivery_skipped(state.listing_id, target.id)
+    unchanged_state = await database.load_target_dispatch_state("channel-status")
     assert unchanged_state is not None
-    assert unchanged_state.channel_statuses["ntfy"] == "sent"
+    assert unchanged_state.target_statuses[target.id] == "sent"

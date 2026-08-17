@@ -59,6 +59,15 @@ function liveApi(overrides: Partial<ApiService>): ApiService {
     deleteTemplate: vi.fn(),
     renderTemplate: vi.fn(),
     testDesktopSound: vi.fn(),
+    updateNotificationSettings: vi.fn(),
+    importSearchUrl: vi.fn(),
+    notificationTargets: vi.fn(),
+    createNotificationTarget: vi.fn(),
+    updateNotificationTarget: vi.fn(),
+    deleteNotificationTarget: vi.fn(),
+    testNotificationTarget: vi.fn(),
+    exportBackup: vi.fn(),
+    importBackup: vi.fn(),
     ...overrides,
   };
 }

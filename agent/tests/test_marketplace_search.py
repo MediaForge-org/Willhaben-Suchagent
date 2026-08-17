@@ -7,6 +7,7 @@ from agent.app.core.models import SearchCategory, SearchDefinition
 from agent.app.willhaben.marketplace_search import (
     MarketplaceSearchBuilder,
     UnsupportedMarketplaceSearch,
+    region_name_for_area_id,
 )
 
 
@@ -84,3 +85,51 @@ def test_search_builder_rejects_unverified_filters() -> None:
         MarketplaceSearchBuilder().build(
             _search(category_filters={"marketplace_category": "unbestaetigt-9999"})
         )
+
+
+def test_search_builder_uses_exact_deep_category_path_not_a_broader_parent() -> None:
+    request = MarketplaceSearchBuilder().build(
+        _search(
+            query="",
+            category_filters={"marketplace_category": "apple/iphone-13-mini-5009987"},
+        )
+    )
+
+    assert request.url.path.endswith("/marktplatz/apple/iphone-13-mini-5009987")
+    assert "smartphones-telefonie" not in str(request.url)
+
+
+def test_search_builder_accepts_deep_category_path_with_optional_keyword() -> None:
+    request = MarketplaceSearchBuilder().build(
+        _search(
+            query="",
+            category_filters={
+                "marketplace_category": "apple/iphone-13-mini-5009987",
+                "marketplace_category_label": "Apple → iPhone 13 Mini",
+            },
+        )
+    )
+
+    assert "keyword" not in request.url.params
+
+
+def test_search_builder_rejects_single_segment_unverified_deep_looking_category() -> None:
+    with pytest.raises(UnsupportedMarketplaceSearch):
+        MarketplaceSearchBuilder().build(
+            _search(category_filters={"marketplace_category": "erfundene-kategorie-1234"})
+        )
+
+
+def test_search_builder_rejects_path_traversal_style_category_segments() -> None:
+    with pytest.raises(UnsupportedMarketplaceSearch):
+        MarketplaceSearchBuilder().build(
+            _search(category_filters={"marketplace_category": "apple/../../etc"})
+        )
+
+
+@pytest.mark.parametrize(
+    ("area_id", "expected"),
+    [("3", "Niederösterreich"), ("900", "Wien"), ("999999", None)],
+)
+def test_region_name_for_area_id_reverses_known_ids(area_id: str, expected: str | None) -> None:
+    assert region_name_for_area_id(area_id) == expected

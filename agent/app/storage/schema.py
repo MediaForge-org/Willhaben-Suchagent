@@ -91,4 +91,40 @@ CREATE TABLE IF NOT EXISTS agent_settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS notification_targets (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    type TEXT NOT NULL CHECK (type IN ('ntfy', 'discord', 'email')),
+    name TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+    ntfy_base_url TEXT,
+    email_address TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_notification_targets_type ON notification_targets(type);
+
+CREATE TABLE IF NOT EXISTS search_notification_targets (
+    search_id INTEGER NOT NULL REFERENCES searches(id) ON DELETE CASCADE,
+    target_id INTEGER NOT NULL REFERENCES notification_targets(id) ON DELETE CASCADE,
+    PRIMARY KEY (search_id, target_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_search_notification_targets_target
+    ON search_notification_targets(target_id);
+
+CREATE TABLE IF NOT EXISTS notification_deliveries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    listing_id INTEGER NOT NULL REFERENCES listings(id) ON DELETE CASCADE,
+    target_id INTEGER NOT NULL REFERENCES notification_targets(id) ON DELETE CASCADE,
+    status TEXT NOT NULL CHECK (status IN ('pending', 'sent', 'failed', 'skipped')),
+    attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    last_attempt_at TEXT,
+    sent_at TEXT,
+    last_error TEXT,
+    UNIQUE (listing_id, target_id)
+);
 """
