@@ -103,14 +103,13 @@ try {
     }
 
     Write-Host "=== 5: Native-messaging framed protocol ==="
-    $pyScript = @"
-import struct, sys
-msg = b'{"type":"api.status"}'
-env = b'{"requestId":"1","request":' + msg + b'}'
-sys.stdout.buffer.write(struct.pack('<I', len(env)))
-sys.stdout.buffer.write(env)
-"@
-    $requestBytes = python -c $pyScript
+    # Native messaging is a binary framing protocol (4-byte little-endian
+    # length prefix + UTF-8 JSON). PowerShell's object pipeline and
+    # "$var = external-command" capture both convert output through text
+    # encoding, which corrupts arbitrary bytes. This section therefore never
+    # pipes through the host process or captures its output as text - it
+    # talks to the raw, redirected stdin/stdout streams directly via .NET
+    # Process/Stream APIs, which is fully binary-safe under PowerShell 7.
     $env:WILLHABEN_API_PORT = "$port"
     # Agent is stopped by now; the host only needs to prove it speaks the
     # framed protocol and stamps protocolVersion - a transport error from the
@@ -118,18 +117,59 @@ sys.stdout.buffer.write(env)
     $agentProcess2 = Start-Process -FilePath $agentExe -PassThru -WindowStyle Hidden
     Start-Sleep -Seconds 2
     try {
-        $requestBytes | & $hostExe | Set-Content -Path "$env:TEMP\host-response.bin" -Encoding Byte
-        $rawBytes = [System.IO.File]::ReadAllBytes("$env:TEMP\host-response.bin")
-        Assert-True ($rawBytes.Length -gt 4) "Host produced framed output"
-        $length = [System.BitConverter]::ToUInt32($rawBytes, 0)
-        $jsonBytes = $rawBytes[4..(4 + $length - 1)]
+        $requestJson = '{"requestId":"1","request":{"type":"api.status"}}'
+        $requestBytes = [System.Text.Encoding]::UTF8.GetBytes($requestJson)
+        $requestFrame = [System.BitConverter]::GetBytes([uint32]$requestBytes.Length) + $requestBytes
+
+        $startInfo = [System.Diagnostics.ProcessStartInfo]::new($hostExe)
+        $startInfo.RedirectStandardInput = $true
+        $startInfo.RedirectStandardOutput = $true
+        $startInfo.RedirectStandardError = $true
+        $startInfo.UseShellExecute = $false
+
+        $hostProcess = [System.Diagnostics.Process]::new()
+        $hostProcess.StartInfo = $startInfo
+        $hostProcess.Start() | Out-Null
+
+        $stdin = $hostProcess.StandardInput.BaseStream
+        $stdin.Write($requestFrame, 0, $requestFrame.Length)
+        $stdin.Flush()
+        $hostProcess.StandardInput.Close()
+
+        # Read exactly the 4-byte length prefix, then exactly that many JSON
+        # bytes - never "read until EOF", so a subsequent stray byte on
+        # stdout is still detectable as an assertion failure below.
+        $stdout = $hostProcess.StandardOutput.BaseStream
+        $lengthPrefix = New-Object byte[] 4
+        $prefixRead = $stdout.Read($lengthPrefix, 0, 4)
+        Assert-True ($prefixRead -eq 4) "Host wrote a 4-byte length prefix"
+        $responseLength = [System.BitConverter]::ToUInt32($lengthPrefix, 0)
+
+        $jsonBytes = New-Object byte[] $responseLength
+        $totalRead = 0
+        while ($totalRead -lt $responseLength) {
+            $chunkRead = $stdout.Read($jsonBytes, $totalRead, $responseLength - $totalRead)
+            if ($chunkRead -eq 0) { break }
+            $totalRead += $chunkRead
+        }
+        Assert-True ($totalRead -eq $responseLength) "Host wrote the full JSON payload ($totalRead of $responseLength bytes)"
+
+        # Exactly one framed message on stdout - no extra stray protocol
+        # bytes/logging: one more byte-read attempt must hit EOF (0 bytes).
+        $extraByte = New-Object byte[] 1
+        $extraRead = $stdout.Read($extraByte, 0, 1)
+        Assert-True ($extraRead -eq 0) "stdout contains exactly one framed message, nothing else"
+
+        # stderr may contain log output - read it (also binary-safe) purely
+        # so the process can exit cleanly; content is not asserted.
+        $stderrText = $hostProcess.StandardError.ReadToEnd()
+        $hostProcess.WaitForExit(5000) | Out-Null
+        if ($stderrText) { Write-Host "Host stderr (log output, expected): $stderrText" }
+
         $response = [System.Text.Encoding]::UTF8.GetString($jsonBytes) | ConvertFrom-Json
         Assert-True ($response.protocolVersion -eq 1) "protocolVersion is 1 (was: $($response.protocolVersion))"
         Assert-True ($response.requestId -eq "1") "requestId echoed correctly"
         Assert-True ($null -ne $response.response) "Response body present"
-        # Exactly one framed message on stdout - no extra stray protocol logging.
-        $expectedTotalLength = 4 + $length
-        Assert-True ($rawBytes.Length -eq $expectedTotalLength) "stdout contains exactly one framed message, nothing else"
     } finally {
         if ($agentProcess2 -and -not $agentProcess2.HasExited) {
             Stop-Process -Id $agentProcess2.Id -Force -ErrorAction SilentlyContinue

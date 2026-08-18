@@ -92,6 +92,42 @@ def test_windows_smoke_test_script_never_uses_real_secrets() -> None:
         assert forbidden not in content
 
 
+@pytest.mark.parametrize(
+    "script",
+    [
+        "deployment/ci/windows-smoke-test.ps1",
+        "deployment/build-release-windows.ps1",
+    ],
+)
+def test_windows_scripts_never_use_powershell5_only_byte_encoding(script: str) -> None:
+    """'-Encoding Byte' (and the equivalent 'Encoding = "Byte"') only exists in
+    Windows PowerShell 5.1 - PowerShell 7 (pwsh, used on windows-2025 runners)
+    rejects it outright. Binary I/O must go through .NET APIs
+    ([System.IO.File]::Read/WriteAllBytes, raw Stream Read/Write) instead."""
+    content = (REPO_ROOT / script).read_text(encoding="utf-8")
+    lowered = content.lower()
+    assert "-encoding byte" not in lowered
+    assert 'encoding = "byte"' not in lowered
+    assert "encoding = 'byte'" not in lowered
+
+
+def test_native_messaging_smoke_test_uses_binary_safe_stream_io() -> None:
+    """Guards against silently regressing back to a PowerShell pipeline/text
+    capture for the framed native-messaging bytes (both mangle binary data,
+    independently of the '-Encoding Byte' bug this replaced)."""
+    content = (REPO_ROOT / "deployment" / "ci" / "windows-smoke-test.ps1").read_text(
+        encoding="utf-8"
+    )
+    assert "RedirectStandardInput" in content
+    assert "RedirectStandardOutput" in content
+    assert ".BaseStream" in content
+    # Must not pipe request bytes into the host executable through the
+    # PowerShell object pipeline, and must not capture its stdout via
+    # "$var = & exe" text capture - both corrupt raw bytes.
+    assert "| & $hostExe" not in content
+    assert "$hostExe |" not in content
+
+
 @pytest.mark.skipif(shutil.which("pwsh") is None, reason="pwsh not installed")
 @pytest.mark.parametrize(
     "script",
