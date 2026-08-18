@@ -22,6 +22,22 @@ def _runtime_dir() -> Path:
     return Path(sys.executable).resolve().parent
 
 
+def _release_root() -> Path:
+    """The release package root: the parent of the runtime/ folder that
+    contains this very executable.
+
+    Deliberately NOT derived from argv, an inherited --project-root value,
+    or the process's current working directory: none of those are reliable
+    (cwd is whatever the caller happened to be in; a passed-through path can
+    be mangled by shell/argument-quoting on the way here, especially one
+    containing spaces). This executable's own on-disk location is the one
+    thing that is always correct — after the whole release folder is moved,
+    re-running this same executable from its new location automatically
+    resolves to the new root.
+    """
+    return _runtime_dir().parent
+
+
 def _agent_executable() -> Path:
     suffix = ".exe" if sys.platform == "win32" else ""
     return _runtime_dir() / f"willhaben-suchagent{suffix}"
@@ -32,7 +48,8 @@ def _host_executable() -> Path:
     return _runtime_dir() / f"willhaben-suchagent-host{suffix}"
 
 
-def _install_linux(project_root: Path) -> int:
+def _install_linux() -> int:
+    project_root = _release_root()
     from agent.app.native_messaging.setup_linux import install as install_native_messaging
 
     launcher, manifest = install_native_messaging(
@@ -63,7 +80,8 @@ def _uninstall_linux() -> int:
     return 0
 
 
-def _install_windows(project_root: Path) -> int:
+def _install_windows() -> int:
+    project_root = _release_root()
     from agent.app.native_messaging.setup_windows import install as install_native_messaging
 
     launcher, manifest = install_native_messaging(
@@ -74,10 +92,10 @@ def _install_windows(project_root: Path) -> int:
     return 0
 
 
-def _uninstall_windows(project_root: Path) -> int:
+def _uninstall_windows() -> int:
     from agent.app.native_messaging.setup_windows import uninstall as uninstall_native_messaging
 
-    uninstall_native_messaging(project_root)
+    uninstall_native_messaging(_release_root())
     print("Native-Messaging-Bridge entfernt.")
     return 0
 
@@ -88,16 +106,21 @@ def main() -> int:
         "action",
         choices=("install-linux", "uninstall-linux", "install-windows", "uninstall-windows"),
     )
-    parser.add_argument("--project-root", type=Path, required=True)
+    # Accepted for backwards compatibility with existing Einrichtung.sh/.bat
+    # invocations, but intentionally unused for path resolution — see
+    # _release_root() for why. Kept optional so a stale/mismatched value can
+    # never break setup; a mismatch would only ever indicate the caller
+    # invoked the wrong copy of this executable, not a bad argument.
+    parser.add_argument("--project-root", type=Path, required=False)
     args = parser.parse_args()
 
     if args.action == "install-linux":
-        return _install_linux(args.project_root)
+        return _install_linux()
     if args.action == "uninstall-linux":
         return _uninstall_linux()
     if args.action == "install-windows":
-        return _install_windows(args.project_root)
-    return _uninstall_windows(args.project_root)
+        return _install_windows()
+    return _uninstall_windows()
 
 
 if __name__ == "__main__":

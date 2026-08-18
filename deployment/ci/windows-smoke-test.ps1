@@ -179,17 +179,52 @@ try {
     Write-Host "=== 6: Native-messaging setup / registry (relocation-safe) ==="
     $registryKeyPath = "HKCU:\Software\Mozilla\NativeMessagingHosts\at.willhaben_suchagent.bridge"
 
+    # The release setup executable derives its own root deterministically
+    # from where it physically sits on disk (parent of the runtime/ folder
+    # containing it) - never from cwd, and never by trusting a possibly
+    # shell-mangled --project-root argument (see run_setup.py's
+    # _release_root()). So a real test of "relocation works" MUST invoke the
+    # copy of the executable that actually lives at the path under test -
+    # reusing a setup-exe handle captured from a different location would
+    # not exercise the relocation logic at all.
     function Test-SetupPointsAtCurrentPath {
-        param([string]$ProjectRoot)
-        & $setupExe install-windows --project-root $ProjectRoot | Out-Null
+        param(
+            [string]$ProjectRoot,
+            [string]$InvokeFromDirectory = $null,
+            [switch]$OmitProjectRootArgument
+        )
+        $currentSetupExe = Join-Path $ProjectRoot "runtime\willhaben-suchagent-setup.exe"
+        Assert-True (Test-Path $currentSetupExe) "Setup executable present at $ProjectRoot"
+
+        $previousLocation = Get-Location
+        if ($InvokeFromDirectory) { Set-Location $InvokeFromDirectory }
+        try {
+            if ($OmitProjectRootArgument) {
+                & $currentSetupExe install-windows | Out-Null
+            } else {
+                & $currentSetupExe install-windows --project-root $ProjectRoot | Out-Null
+            }
+        } finally {
+            Set-Location $previousLocation
+        }
+
         Assert-True (Test-Path $registryKeyPath) "Registry key exists after install"
-        $manifestPath = (Get-ItemProperty -Path $registryKeyPath -Name "(default)").( "(default)" )
-        Assert-True ($manifestPath.StartsWith($ProjectRoot)) "Registry value points inside current project root ($ProjectRoot)"
+        $manifestPath = (Get-ItemProperty -Path $registryKeyPath -Name "(default)").("(default)")
         $manifestContent = Get-Content $manifestPath -Raw | ConvertFrom-Json
-        Assert-True ($manifestContent.path.StartsWith($ProjectRoot)) "Manifest launcher path points inside current project root"
         $launcherContent = Get-Content $manifestContent.path -Raw
+
+        # Always visible in the log (pass or fail) - makes a future
+        # regression immediately diagnosable without re-running CI blind.
+        Write-Host "Expected release root:     $ProjectRoot"
+        Write-Host "Actual registry manifest path: $manifestPath"
+        Write-Host "Actual manifest host path:     $($manifestContent.path)"
+        Write-Host "Actual launcher content:       $launcherContent"
+
+        Assert-True ($manifestPath.StartsWith($ProjectRoot)) "Registry value points inside current project root ($ProjectRoot)"
+        Assert-True ($manifestContent.path.StartsWith($ProjectRoot)) "Manifest launcher path points inside current project root"
         Assert-True ($launcherContent.Contains($ProjectRoot)) "Launcher wraps the bundled host executable at the current path"
-        & $setupExe uninstall-windows --project-root $ProjectRoot | Out-Null
+
+        & $currentSetupExe uninstall-windows --project-root $ProjectRoot | Out-Null
         Assert-True (-not (Test-Path $registryKeyPath)) "Registry key removed after uninstall"
     }
 
@@ -201,7 +236,21 @@ try {
     Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $relocatedRoot
     Copy-Item -Recurse -Path $StageDir -Destination $relocatedRoot
 
-    Test-SetupPointsAtCurrentPath -ProjectRoot $relocatedRoot
+    # cwd is deliberately something else entirely, and --project-root is
+    # deliberately omitted: the setup executable must still resolve its own
+    # location correctly, proving relocation doesn't depend on either.
+    Test-SetupPointsAtCurrentPath -ProjectRoot $relocatedRoot -InvokeFromDirectory $env:TEMP -OmitProjectRootArgument
+
+    Write-Host "=== 8: Old build path must not leak into any generated artifact ==="
+    $currentSetupExe = Join-Path $relocatedRoot "runtime\willhaben-suchagent-setup.exe"
+    & $currentSetupExe install-windows --project-root $relocatedRoot | Out-Null
+    $manifestPath = (Get-ItemProperty -Path $registryKeyPath -Name "(default)").("(default)")
+    $manifestContent = Get-Content $manifestPath -Raw | ConvertFrom-Json
+    $launcherContent = Get-Content $manifestContent.path -Raw
+    Assert-True (-not $manifestPath.Contains($StageDir)) "Registry manifest path has no trace of the original build path"
+    Assert-True (-not $manifestContent.path.Contains($StageDir)) "Manifest host path has no trace of the original build path"
+    Assert-True (-not $launcherContent.Contains($StageDir)) "Launcher content has no trace of the original build path"
+    & $currentSetupExe uninstall-windows --project-root $relocatedRoot | Out-Null
 
     Write-Host ""
     Write-Host "ALL WINDOWS SMOKE TESTS PASSED"
