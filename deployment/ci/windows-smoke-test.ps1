@@ -19,6 +19,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot "windows-path-utils.ps1")
 Start-Transcript -Path $LogPath -Force | Out-Null
 
 function Assert-True {
@@ -220,9 +221,9 @@ try {
         Write-Host "Actual manifest host path:     $($manifestContent.path)"
         Write-Host "Actual launcher content:       $launcherContent"
 
-        Assert-True ($manifestPath.StartsWith($ProjectRoot)) "Registry value points inside current project root ($ProjectRoot)"
-        Assert-True ($manifestContent.path.StartsWith($ProjectRoot)) "Manifest launcher path points inside current project root"
-        Assert-True ($launcherContent.Contains($ProjectRoot)) "Launcher wraps the bundled host executable at the current path"
+        Assert-True (Test-WindowsPathIsUnderRoot $manifestPath $ProjectRoot) "Registry value points inside current project root ($ProjectRoot)"
+        Assert-True (Test-WindowsPathIsUnderRoot $manifestContent.path $ProjectRoot) "Manifest launcher path points inside current project root"
+        Assert-True (Test-TextContainsWindowsPath $launcherContent $ProjectRoot) "Launcher wraps the bundled host executable at the current path"
 
         & $currentSetupExe uninstall-windows --project-root $ProjectRoot | Out-Null
         Assert-True (-not (Test-Path $registryKeyPath)) "Registry key removed after uninstall"
@@ -247,9 +248,9 @@ try {
     $manifestPath = (Get-ItemProperty -Path $registryKeyPath -Name "(default)").("(default)")
     $manifestContent = Get-Content $manifestPath -Raw | ConvertFrom-Json
     $launcherContent = Get-Content $manifestContent.path -Raw
-    Assert-True (-not $manifestPath.Contains($StageDir)) "Registry manifest path has no trace of the original build path"
-    Assert-True (-not $manifestContent.path.Contains($StageDir)) "Manifest host path has no trace of the original build path"
-    Assert-True (-not $launcherContent.Contains($StageDir)) "Launcher content has no trace of the original build path"
+    Assert-True (-not (Test-TextContainsWindowsPath $manifestPath $StageDir)) "Registry manifest path has no trace of the original build path"
+    Assert-True (-not (Test-TextContainsWindowsPath $manifestContent.path $StageDir)) "Manifest host path has no trace of the original build path"
+    Assert-True (-not (Test-TextContainsWindowsPath $launcherContent $StageDir)) "Launcher content has no trace of the original build path"
     & $currentSetupExe uninstall-windows --project-root $relocatedRoot | Out-Null
 
     Write-Host ""

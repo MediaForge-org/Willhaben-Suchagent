@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -128,12 +129,85 @@ def test_native_messaging_smoke_test_uses_binary_safe_stream_io() -> None:
     assert "$hostExe |" not in content
 
 
+def test_smoke_test_dot_sources_windows_path_utils() -> None:
+    content = (REPO_ROOT / "deployment" / "ci" / "windows-smoke-test.ps1").read_text(
+        encoding="utf-8"
+    )
+    assert "windows-path-utils.ps1" in content
+
+
+def test_smoke_test_path_assertions_use_case_insensitive_helpers() -> None:
+    """Windows paths are case-insensitive, but a plain .StartsWith()/
+    .Contains() in PowerShell is case-sensitive - that mismatch is exactly
+    what made "C:\\Temp\\..." (as actually created by the OS) fail an
+    assertion written against an expected "C:\\temp\\..." literal. Guards
+    against silently going back to the raw string operators for any of the
+    registry/manifest/launcher/old-path checks."""
+    content = (REPO_ROOT / "deployment" / "ci" / "windows-smoke-test.ps1").read_text(
+        encoding="utf-8"
+    )
+    assert "Test-WindowsPathIsUnderRoot" in content
+    assert "Test-TextContainsWindowsPath" in content
+    assert ".StartsWith($ProjectRoot)" not in content
+    assert ".Contains($ProjectRoot)" not in content
+    assert ".Contains($StageDir)" not in content
+
+
+@pytest.mark.skipif(
+    shutil.which("pwsh") is None or sys.platform != "win32",
+    reason="[System.IO.Path]::GetFullPath only parses backslash Windows paths under a real "
+    "Windows OS - on Linux/macOS pwsh it treats 'C:\\foo' as a literal relative filename",
+)
+def test_windows_path_utils_compare_case_insensitively() -> None:
+    """Exercises the actual comparison logic (not just source-text greps):
+    a differently-cased drive/segment must count as the same Windows path,
+    while a same-prefix sibling directory (foo vs foobar) must not be
+    mistaken for a subpath - both by running the real functions under pwsh."""
+    utils_path = REPO_ROOT / "deployment" / "ci" / "windows-path-utils.ps1"
+    script = f"""
+$ErrorActionPreference = "Stop"
+. '{utils_path}'
+
+$results = @{{
+    sameCaseDiffers = Test-WindowsPathsEqual `
+        'C:\\temp\\Willhaben Test\\Willhaben-Suchagent-1.0.0' `
+        'C:\\Temp\\Willhaben Test\\Willhaben-Suchagent-1.0.0'
+    underRootCaseDiffers = Test-WindowsPathIsUnderRoot `
+        'C:\\Temp\\Willhaben Test\\Willhaben-Suchagent-1.0.0\\runtime\\host.exe' `
+        'C:\\temp\\Willhaben Test\\Willhaben-Suchagent-1.0.0'
+    containsCaseDiffers = Test-TextContainsWindowsPath `
+        '"C:\\Temp\\Willhaben Test\\Willhaben-Suchagent-1.0.0\\runtime\\host.exe"' `
+        'C:\\temp\\Willhaben Test\\Willhaben-Suchagent-1.0.0'
+    siblingNotUnderRoot = Test-WindowsPathIsUnderRoot 'C:\\temp\\foobar\\thing.txt' 'C:\\temp\\foo'
+    siblingNotContained = Test-TextContainsWindowsPath 'C:\\temp\\foobar\\thing.txt' 'C:\\temp\\foo'
+    exactRootIsUnderRoot = Test-WindowsPathIsUnderRoot 'C:\\temp\\foo' 'C:\\temp\\foo'
+}}
+$results | ConvertTo-Json -Compress
+"""
+    result = subprocess.run(  # noqa: S603
+        ["pwsh", "-NoProfile", "-Command", script],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    import json
+
+    parsed = json.loads(result.stdout.strip().splitlines()[-1])
+    assert parsed["sameCaseDiffers"] is True
+    assert parsed["underRootCaseDiffers"] is True
+    assert parsed["containsCaseDiffers"] is True
+    assert parsed["siblingNotUnderRoot"] is False
+    assert parsed["siblingNotContained"] is False
+    assert parsed["exactRootIsUnderRoot"] is True
+
+
 @pytest.mark.skipif(shutil.which("pwsh") is None, reason="pwsh not installed")
 @pytest.mark.parametrize(
     "script",
     [
         "deployment/build-release-windows.ps1",
         "deployment/ci/windows-smoke-test.ps1",
+        "deployment/ci/windows-path-utils.ps1",
     ],
 )
 def test_powershell_scripts_have_valid_syntax(script: str) -> None:
